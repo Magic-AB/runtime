@@ -47,9 +47,9 @@ Decisions below use two placeholder tokens. They are descriptions, not names.
 | `[PENDING-STATUS: estimable]` | The data determine the estimand (a point or a bound), and the estimator reports it with an uncertainty that has been checked. |
 | `[PENDING-STATUS: not-identifiable]` | The data cannot determine the estimand. The estimator says so, with reasons and the remedy that would change the answer. |
 
-Andrew's scheme has a third term, *absent*. This draft does not know whether it
-means "the mechanism is estimated to be absent" or "the signal the estimand
-needs is absent from the data", so **it is not used anywhere below**. See §12,
+Andrew's scheme has a third term, *absent*. Andrew defines it as "absent means
+the mechanism isn't present" (Slack, Oct 5), and **it is used only in the Oct 8
+additions** to §7-§10 and §12. See §12,
 item 1.
 
 ### 0.2 Mechanisms
@@ -303,6 +303,13 @@ than assumed to be zero.
 | **Telemetry or intervention** | None to compute it. The telemetry of §4 (clock, batch) shrinks the bound needed. |
 | **Proposed interface** | `sensitivity(result, *, confounder_bound: float) -> AttributionResult`, returning the widened interval, with status `[PENDING-STATUS: not-identifiable]` when the interval crosses zero. |
 
+**Added Oct 8:** Andrew defines his third status as "absent means the mechanism
+isn't present" (Slack, Oct 5). A verdict like that needs a null result whose
+interval, after widening by the stated bound, is tight enough to exclude a
+meaningful effect. dr.py cannot supply one: its near-zero se (E6) is rounding
+error, so the interval it implies is narrow without measuring anything. §14
+item d names the thresholds this bound would replace.
+
 ---
 
 ## 8. Partial identification
@@ -331,6 +338,13 @@ reason "the data cannot place the effect" (`separation.py:407-412`).
 | **Failure modes** | A broken assumption that looks like an effect: efficiency changing with operating point gives "a spurious intercept of either sign" (`mechanism_model.md:187-190`). |
 | **Telemetry or intervention** | A reference sweep for attributing a change. `mechanism_model.md` does not say what would separate `α` from `η`; see §12. |
 | **Proposed interface** | The shared result's `identified` field states which function is identified (for example "(1+α)/η"), with `interval` for it. Status `[PENDING-STATUS: estimable]` applies to that function only, never to its components. |
+
+**Added Oct 8:** By Andrew's definition, "absent means the mechanism isn't
+present" (Slack, Oct 5). In this section's terms that is a bound, not a point:
+the identified interval must lie inside the margin that counts as no effect, as
+`decide` requires before it reports none. A point estimate of 0 with dr.py's
+near-zero se (E6) does not meet that; §10's scenario 3b gets the point right,
+but its interval is rounding error.
 
 ---
 
@@ -384,6 +398,19 @@ in all but the "no treated rows" case.
 | **Telemetry or intervention** | None for the reporting itself. The remedies name what each case needs. |
 | **Proposed interface** | `attribute_dr` returns one `AttributionResult` per *candidate* pair, including those it could not estimate, instead of a list of the ones it could. |
 
+**Added Oct 8 (proposed, pending Andrew):** the probe's empty-result scenarios,
+mapped using the placeholders and Andrew's definition "absent means the
+mechanism isn't present" (Slack, Oct 5):
+
+- Scenario 2 (every attention row treated): `[PENDING-STATUS: not-identifiable]`-style.
+  Positivity fails, because no control rows exist.
+- Scenario 3a (truncation): `[PENDING-STATUS: not-identifiable]`-style. The treated
+  rows exist, but dr.py discards them.
+- Scenario 1 (healthy run, no mechanism): "absent" only for a mechanism that
+  would be visible in `r_kt`. `mechanism_model.md` says M2 and M3g are not
+  ("M2 and M3g are invisible to them", `:153`; both read `r_kt` 0 at `:146`,
+  `:148`), so for those an empty result cannot show absence. See §12, item 1.
+
 ---
 
 ## 10. Worked example (CPU-only): one identification, one silent abstention
@@ -434,6 +461,13 @@ it abstains (the third test), stops trusting a near-zero se (the first), or stop
 truncating to the shortest series (the second), and then to be rewritten against
 the new contract.
 
+**Added Oct 8 (proposed, pending Andrew):** using §9's mapping, scenario 3a and the
+third test's all-steps case (probe scenario 2) are `[PENDING-STATUS: not-identifiable]`-style:
+discarded data and a positivity failure. The third test's healthy case (probe
+scenario 1) would be Andrew's "absent" ("absent means the mechanism isn't
+present", Slack, Oct 5) only for a mechanism visible in `r_kt`;
+`mechanism_model.md:153` says M2 and M3g are not.
+
 ---
 
 ## 11. Summary of decisions
@@ -452,10 +486,14 @@ the new contract.
 
 ## 12. Judgment calls to revisit when Andrew's code lands
 
-1. **The third status term.** *Absent* is not used because this draft does not
-   know whether it means "mechanism estimated absent" or "required signal absent
-   from the data". The "no treated rows" row in §9 is the case most likely to
-   need it.
+1. **The third status term.** Andrew's definition (Slack, Oct 5): "absent means
+   the mechanism isn't present". It is a statement about the mechanism, not
+   about the data. **Open: does "absent" require a positive check that the
+   mechanism would have been visible in this data, or is it the default when
+   nothing is found? [PENDING: Andrew]** The answer decides the "no treated
+   rows" row in §9 and every mechanism the residuals cannot see (M2 and M3g,
+   `mechanism_model.md:153`). The Oct 8 additions to §7-§10 assume the
+   positive-check reading.
 2. **Two placeholders, not three.** §0.1 defines `estimable` and
    `not-identifiable` placeholders only. If Andrew's scheme splits either, §2's
    `status` type and the tables in §§3-9 that name a placeholder need updating;
@@ -481,3 +519,100 @@ the new contract.
 Granger attribution (`attribution.py`) except where it shares dr.py's series
 construction; scheduler and collective causes (audit Q3.3-Q3.4); multi-rank
 mechanisms; any GPU measurement. Nothing in this document has run on a GPU.
+
+---
+
+## 14. Andrew's cause list (Oct 8 draft, not in the repo, provisional)
+
+Source: Andrew's Slack messages of Oct 8. They contain a draft document, "The 25
+named slowdown causes: what each row is for", and his answers to three questions
+about it. None of it is in the repo, so nothing here cites a file or a commit.
+Row numbers are his. The rows are not copied here, and none is mapped to a
+status.
+
+**a. Two ways to be not identifiable.**
+
+- *Data failure:* a capture could determine the estimand, but this one, or this
+  estimator, does not. Probe scenario 3a is the example: the treated rows exist,
+  and dr.py discards them (§10).
+- *Structural:* no single passive capture can determine it, however it is
+  analysed. His document lists four sets of rows that "produce the same signal
+  and can only be reported together until the extra data arrives": 8 with 23,
+  6 with 9, 12 with 17, and 13 with 14 and 15. Asked how they are reported,
+  Andrew answered "right now it is one status per group", so the unit that
+  carries a status is the group, not the row. This is the subject of §8: the
+  data determine something about the group, not about each member.
+
+**b. Passive or not.** His document sorts the 25 rows by the data each needs:
+
+| data needed | rows |
+|---|---|
+| passive data alone (trace, `/metrics` counters, NVML samples, drop count) | 10 |
+| richer passive records (step ids, runtime API records, host CPU counters, request gauge) | 6 |
+| a second capture as reference | 3 |
+| not passive: an untraced run, a calibration capture, or other tenants' activity | 6 |
+
+These categories correspond to the **Telemetry or intervention** row in each
+table of §3-§9.
+
+**c. Where the survey's methods apply.** His document notes that "a time is
+associated with a cause, it is not the time removing the cause would recover".
+That note marks the line. Rows 10, 11, 22 and 25 are the only rows that give
+seconds, and they get them by trace accounting: "the trace rows add up with
+busy time and a remainder to the full window". That is not inference and needs
+none of §3-§9. The survey's methods apply to claims about what removing a
+cause would change.
+
+**d. Thresholds.** His document says its thresholds "are judgement calls, not
+derived from data". They are the target for §7: each is an unverifiable number
+that should be stated and carried into the result, as `EPS_MAX_S` is. The values
+cannot be cited here. The registry holding them, with aliases and scope, is not
+available: his document referred to it, and Andrew confirmed "Yes. i removed the
+reference".
+
+**e. Mapping to the mechanism model.** Andrew mapped each row to a mechanism in
+`docs/mechanism_model.md`. Group sizes only:
+
+| mechanism | rows |
+|---|---|
+| M1 region slowdown | 5 |
+| M2 serialization | 4 |
+| M3g idle gap | 5 |
+| M3, k or g | 2 |
+| M4 regime gate | 4 |
+| M5ε tracer overhead | 1 |
+| M5m misroute | 1 |
+| none (baseline: expected behaviour, not a deviation) | 3 |
+| total | 25 |
+
+His caveats:
+
+- Rows 2, 3 and 4 are scheduler-level. `mechanism_model.md` does not cover
+  scheduler-level mechanisms, so their mappings are "the closest fit only".
+- Row 17 is "M3k or M3g, not known which".
+- "No row maps firmly to M3k (in-kernel additive cost)". Row 17 is the only
+  candidate.
+
+**f. Groups are not mechanism classes (this draft's reading, not Andrew's).**
+Two of the four sets sit inside one mechanism class: 6 with 9 (both M3g), and 13
+with 14 and 15 (all M1). The other two span classes: 8 with 23 (M3g and M5ε),
+and 12 with 17 (M4, and M3k or M3g). So output per group is not the same as
+output per mechanism class. One qualification: Andrew gives row 12's gated inner
+mechanism as M3g, so if row 17 turns out to be M3g, that pair shares an inner
+mechanism but still not a class.
+
+**g. Open questions.**
+
+- Rows 22 and 25 are labelled "additive" in the registry. Andrew mapped them to
+  M2 because `mechanism_model.md` uses exposed side-stream time as M2's
+  signature, and noted "The two documents disagree here". Which is
+  authoritative? **[PENDING: Andrew]**
+- Is the output per cause, per mechanism class, or per group? Item f shows these
+  differ. **[PENDING: Andrew]**
+- One status per group is how it works "right now", so the unit may change.
+  **[PENDING: Andrew]**
+
+**h. One unconfirmed inconsistency.** His document says "14 rows have no lever"
+but also "8 rows point to a named config lever", and exactly 8 rows are marked
+as pointing to one. That leaves 17 rows without a lever, not 14. One possible
+reading, not confirmed: 17 minus the 3 baseline rows (7, 16, 21) is 14.
