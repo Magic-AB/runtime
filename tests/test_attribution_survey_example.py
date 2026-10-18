@@ -88,38 +88,41 @@ def test_without_lm_head_the_null_effect_is_identified_but_its_p_values_are_nois
         assert by_effect[e].p_value < 1.0
 
 
-def test_lm_head_truncation_abstains_silently_although_a_treatment_exists():
+def test_lm_head_no_longer_truncates_the_treatment_away():
+    """Before #137 every op was cut to the shortest series (``lm_head``, 8 rows),
+    which removed attention's treated rows and returned nothing. Pairs are now
+    aligned per pair, so the same data gives four estimates."""
     fx, res = _observe(INJECTED)
 
     attn = _rows(res, ATTN)
     assert sum(abs(k.r_kt) > BAND for k in attn) == 64
-
-    # lm_head runs once per step, so it is the shortest series and attribute_dr
-    # truncates every op to its length.
     lengths = {op: len(_rows(res, op)) for op in {k.op for k in res.per_kernel}}
     assert lengths["lm_head"] == N_STEPS == min(lengths.values())
-    # The rows that survive are attention's step 0, layers 0-7: none treated.
-    survivors = attn[:N_STEPS]
-    assert [k.layer for k in survivors] == list(range(N_STEPS))
-    assert not any(abs(k.r_kt) > BAND for k in survivors)
 
-    assert attribute_dr(res, fx.graph).hypotheses == []
-    # The same rows without lm_head support four estimates, so the empty result
-    # is a failure to estimate, not an absence of anything estimable.
+    out = attribute_dr(res, fx.graph)
+    assert len(out.hypotheses) == 4
+    assert out.status.value == "ok" and out.n_obs_used == 256
     assert len(attribute_dr(_without(res, "lm_head"), fx.graph).hypotheses) == 4
 
 
-def test_no_anomaly_no_controls_and_truncation_return_the_same_empty_result():
+def test_the_empty_result_now_says_why_but_two_cases_share_a_reason():
+    """Before #137 no anomaly, every row treated and truncation all returned the
+    same bare empty value. The first two still return no hypotheses, now with a
+    status and the per-cause treated counts; the reason text is identical for
+    both, so only ``skipped_causes`` tells them apart."""
     fx_healthy, healthy = _observe()
     fx_all, all_steps = _observe(RegionSlowdown(0.5, ops={ATTN}))
-    fx_trunc, truncated = _observe(INJECTED)
 
     assert not any(abs(v) > BAND for v in _series(healthy, ATTN))
     assert all(abs(v) > BAND for v in _series(all_steps, ATTN))
 
-    results = [attribute_dr(healthy, fx_healthy.graph),
-               attribute_dr(all_steps, fx_all.graph),
-               attribute_dr(truncated, fx_trunc.graph)]
-    assert results[0] == results[1] == results[2] == RankedHypotheses(hypotheses=[])
-    # The return type has no field that could say which case it was.
-    assert [f.name for f in dataclasses.fields(RankedHypotheses)] == ["hypotheses"]
+    h = attribute_dr(healthy, fx_healthy.graph)
+    a = attribute_dr(all_steps, fx_all.graph)
+    assert h.hypotheses == [] and a.hypotheses == []
+    assert h.status.value == a.status.value == "insufficient_data"
+    assert h.reason == a.reason == "no op had at least 3 out-of-band and 3 in-band samples"
+    # The one thing that separates them: how many rows were treated.
+    assert h.skipped_causes[ATTN] == 0
+    assert a.skipped_causes[ATTN] == 256
+    # Neither says which of the two it was, and neither says "nothing to explain".
+    assert [f.name for f in dataclasses.fields(RankedHypotheses)][0] == "hypotheses"
