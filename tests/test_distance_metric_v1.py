@@ -233,7 +233,7 @@ def test_every_failing_gate_is_reported_in_doc_order(base):
 def test_bridge_uses_measured_mean_running_when_there_is_one():
     stats = SimpleNamespace(n_samples=12, mean_running=40.6)
     f = extract_features(dataclasses.replace(_point(), scheduler_stats=stats), CFG)
-    assert (f.batch, f.kv_cache_len, f.batch_source) == (41, 4352, "mean_running")
+    assert (f.batch, f.kv_cache_len, f.batch_source) == (41, 4352, "running")  # the loop helper's own label
 
 
 def test_bridge_caps_concurrency_at_max_num_seqs():

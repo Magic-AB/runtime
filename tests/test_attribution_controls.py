@@ -543,9 +543,10 @@ def test_run_local_is_deterministic_and_says_what_it_is():
 
 
 # ── dr.py through the adapter ───────────────────────────────────────────────
-# These pin dr.py's current behaviour (survey §1, E1-E6) and are expected to
-# change when dr.py is fixed. Seeds are pinned in controls.py; the p-values
-# are the ones gitm/research/dr_probe.py prints.
+# These pin dr.py's behaviour as of main at d3a1518, which includes #137. Before
+# #137 the direction case was wrong-confident (E1) and three cases returned an
+# empty result (E3); both changed. They are expected to change again when dr.py
+# does. Seeds are pinned in controls.py.
 
 DR_OUTCOMES = {
     # Correct op, but the confidence comes from p-values over a near-zero se (E6).
@@ -553,15 +554,17 @@ DR_OUTCOMES = {
     "pos_attn_weak": CORRECT,
     "pos_mlp_down_steps0to3": CORRECT,
     "pos_qkv_additive": CORRECT,
-    # E1: direction-blind. B -> A ranks first on dr.py's own test fixture.
-    "pos_series_direction_seed3": WRONG_CONFIDENT,
-    # E3: an empty result, with no reason, on every one of these.
+    # After #137 the direction case names A, the true cause (it named B before).
+    "pos_series_direction_seed3": CORRECT,
+    # Still an empty result, with no reason, on every healthy run.
     "null_healthy_seed0": MISSED,
     "null_healthy_seed1": MISSED,
     "null_healthy_seed2": MISSED,
-    "amb_gate_vs_onset": MISSED,
+    # Now names attention, at confidence 0.9996 (empty before #137).
+    "amb_gate_vs_onset": CORRECT,
     "amb_cost_vs_tracer": MISSED,
-    "hostile_lm_head_truncation": MISSED,
+    # Now names attention, at 0.9231 (empty before #137).
+    "hostile_lm_head_truncation": CORRECT,
     "hostile_every_row_treated": MISSED,
     # E4/E5: independent series. Wrong at every seed; confident where p is small.
     "hostile_independent_spikes_seed0": WRONG_HEDGED,
@@ -576,11 +579,14 @@ def test_dr_outcome_on_every_case(dr_validation):
     assert {r.case: r.outcome for r in dr_validation.report.results} == DR_OUTCOMES
 
 
-def test_dr_truncation_is_missed_not_an_abstention(suite, dr_validation):
+def test_dr_truncation_is_now_found_but_with_a_near_zero_se(suite, dr_validation):
     r = next(r for r in dr_validation.report.results if r.case == "hostile_lm_head_truncation")
-    assert r.outcome == MISSED and r.outcome != VALID_ABSTENTION
+    assert r.outcome == CORRECT
     v = dr_estimator(_case(suite, "hostile_lm_head_truncation").build())
-    assert v == Verdict(None, None, None)
+    assert v.claim == Claim.of(op=ATTN)
+    # E6 is still there: the ATE is +0.000 with se=0.000, and the confidence
+    # comes from a p-value over that.
+    assert "se=0.000" in v.reasons[0]
     # The planted cause was there: 64 attention rows outside the band.
     inp = _case(suite, "hostile_lm_head_truncation").build()
     assert sum(abs(k.r_kt) > 0.4 for k in inp.residuals.per_kernel if k.op == ATTN) == 64
@@ -592,20 +598,20 @@ def test_dr_independent_series_are_confidently_wrong_where_p_is_small(dr_validat
     assert seed45.claim == "A/*"
     assert seed45.confidence == 1.0 - 2.771156616538538e-05  # dr_probe scenario 5, seed 45
     assert by_case["hostile_independent_ar1_seed2"].confidence >= THRESHOLD
-    assert by_case["hostile_independent_ar1_seed10"].claim == "B/*"  # B -> A, p = 0.0
+    assert by_case["hostile_independent_ar1_seed10"].claim == "A/*"  # p = 0.0
     assert by_case["hostile_independent_spikes_seed0"].confidence < THRESHOLD
 
 
 def test_dr_is_invalid_and_the_report_shows_its_usefulness_too(dr_validation):
     assert dr_validation.status == INVALID
     assert {f.case for f in dr_validation.failures} == {
-        "pos_series_direction_seed3", "hostile_independent_spikes_seed45",
+        "hostile_independent_spikes_seed45",
         "hostile_independent_ar1_seed2", "hostile_independent_ar1_seed10"}
-    assert "positive identification 4/5 = 80%" in dr_validation.summary()
+    assert "positive identification 5/5 = 100%" in dr_validation.summary()
 
 
 def test_dr_adapter_mapping(suite):
     v = dr_estimator(_case(suite, "pos_series_direction_seed3").build())
-    assert v.claim == Claim.of(op="B") and v.status is None
+    assert v.claim == Claim.of(op="A") and v.status is None
     assert v.confidence == 1.0  # p underflows to 0.0
-    assert v.reasons[0].startswith("top of 2 hypotheses: B -> A")
+    assert v.reasons[0].startswith("top of 2 hypotheses: A -> B")

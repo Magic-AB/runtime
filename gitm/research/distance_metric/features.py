@@ -203,9 +203,11 @@ def bridge(point: PointDescription) -> tuple[int | None, int | None, str | None,
     """``(batch, kv_cache_len, batch_source, not_bridgeable_reason)`` per §2."""
     regime = point.regime
     kv = regime.input_p50 + regime.output_p50 // 2
-    measured = _batch_config_from_stats(point.scheduler_stats)
+    # The loop's helper returns ``(config, source)``; ``source`` says whether the
+    # batch was a direct running count or an in-flight upper bound.
+    measured, measured_source = _batch_config_from_stats(point.scheduler_stats)
     if measured is not None:
-        return measured.batch, kv, "mean_running", None
+        return measured.batch, kv, measured_source or "mean_running", None
     if regime.concurrency is None:
         return None, None, None, "open_loop_unmeasured"
     seqs = _read_knob(point.engine, "max_num_seqs")
