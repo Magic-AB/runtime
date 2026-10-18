@@ -34,8 +34,9 @@ from pathlib import Path
 import numpy as np
 
 from gitm.optimizer import mechanism_fixtures as mf
+from gitm.optimizer.attribution import aligned_pairs
 from gitm.optimizer.dr import attribute_dr, doubly_robust_ate
-from gitm.optimizer.monitor import KernelResidual, Residuals
+from gitm.optimizer.monitor import KernelResidual, Residuals, residual_series
 from gitm.planner.graph import predict_graph
 from gitm.planner.roofline import BatchConfig
 
@@ -108,43 +109,53 @@ def _residuals(series: dict[str, np.ndarray]) -> Residuals:
 
 
 def _view(res: Residuals) -> dict:
-    """What attribute_dr will see. Reporting only: estimates come from dr.py."""
-    series: dict[str, list[float]] = {}
-    for kr in res.per_kernel:
-        series.setdefault(kr.op, []).append(kr.r_kt)
+    """What attribute_dr will see, mirrored from its pairing rule. Reporting
+    only: estimates come from dr.py. Since #137 each ordered pair is aligned on
+    its own shorter length (``aligned_pairs``), not on the shortest series."""
+    series = residual_series(res)
     ops = [op for op, v in series.items() if len(v) >= 4]
-    n = min((len(series[op]) for op in ops), default=0)
     per_op = {}
     for op, v in series.items():
-        full_t = int(sum(abs(x) > BAND for x in v))
-        trunc_t = int(sum(abs(x) > BAND for x in v[:n])) if op in ops else None
-        eligible = op in ops and trunc_t >= 3 and (n - trunc_t) >= 3
-        per_op[op] = dict(rows=len(v), treated_full=full_t, treated_trunc=trunc_t, eligible=eligible)
-    causes = [op for op in ops if per_op[op]["eligible"]]
-    pairs = [(c, e) for c in causes for e in ops if e != c]
-    return dict(series=series, ops=ops, n=n, per_op=per_op, pairs=pairs)
+        per_op[op] = dict(rows=len(v), treated_full=int(sum(abs(x) > BAND for x in v)))
+    pairs, n_treated, ineligible = [], {}, {}
+    for c, e, n in aligned_pairs(series, ops):
+        n_t = int(sum(abs(x) > BAND for x in series[c][:n]))
+        if n_t >= 3 and (n - n_t) >= 3:
+            pairs.append((c, e))
+            n_treated[(c, e)] = n_t
+        else:
+            ineligible.setdefault(c, (n_t, n - n_t))
+    return dict(series=series, ops=ops, per_op=per_op, pairs=pairs,
+                n_treated=n_treated, ineligible=ineligible)
 
 
 def _print_view(v: dict) -> None:
-    print(f"  ops with >= 4 rows: {len(v['ops'])}; every series truncated to n = {v['n']} rows")
-    print(f"  {'op':<18}{'rows':>6}{'treated (full)':>16}{'treated/control (truncated)':>30}  cause?")
+    print(f"  ops with >= 4 rows: {len(v['ops'])}; each pair is aligned on its own shorter length")
+    print(f"  {'op':<18}{'rows':>6}{'treated (full)':>16}  cause?")
     for op, d in v["per_op"].items():
-        tc = "-" if d["treated_trunc"] is None else f"{d['treated_trunc']}/{v['n'] - d['treated_trunc']}"
-        print(f"  {op:<18}{d['rows']:>6}{d['treated_full']:>16}{tc:>30}  {'yes' if d['eligible'] else 'no'}")
-    print(f"  pairs tested: {len(v['pairs'])}" + (f" -> {v['pairs']}" if v["pairs"] else ""))
+        ok = any(c == op for c, _ in v["pairs"])
+        print(f"  {op:<18}{d['rows']:>6}{d['treated_full']:>16}  {'yes' if ok else 'no'}")
+    print(f"  pairs expected: {len(v['pairs'])}" + (f" -> {v['pairs']}" if v["pairs"] else ""))
 
 
 def _print_hyps(ranked, v: dict | None = None) -> None:
     hs = ranked.hypotheses
-    print(f"  attribute_dr returned {len(hs)} hypotheses")
+    print(f"  attribute_dr returned {len(hs)} hypotheses; status={ranked.status.value}, "
+          f"pairs_attempted={ranked.pairs_attempted}, completed={ranked.pairs_completed}, "
+          f"degraded={ranked.pairs_degraded}, n_obs_used={ranked.n_obs_used}")
+    if ranked.reason:
+        print(f"  reason: {ranked.reason}")
+    if ranked.skipped_causes:
+        print(f"  skipped_causes (treated rows): {dict(ranked.skipped_causes)}")
     for i, h in enumerate(hs, 1):
         print(f"    #{i} {h.cause_op} -> {h.effect_op}  p={h.p_value!r}  {h.direction}  [{h.notes}]")
     if v is not None:
         expected = {(c, e) for c, e in v["pairs"]}
         got = {(h.cause_op, h.effect_op) for h in hs}
-        n_t_ok = all(f"n_treated={v['per_op'][h.cause_op]['treated_trunc']})" in h.notes for h in hs)
-        print(f"  cross-check: hypotheses == pairs tested: {got == expected}; "
-              f"n_treated matches truncated count: {n_t_ok}")
+        n_t_ok = all(f"n_treated={v['n_treated'][(h.cause_op, h.effect_op)]})" in h.notes
+                     for h in hs if (h.cause_op, h.effect_op) in v["n_treated"])
+        print(f"  cross-check: hypotheses == pairs expected: {got == expected}; "
+              f"n_treated matches the aligned count: {n_t_ok}")
 
 
 def _fixture(mechanisms=()) -> mf.Fixture:
@@ -201,8 +212,7 @@ def scenario_2() -> None:
     v = _view(res)
     _print_view(v)
     d = v["per_op"][ATTN]
-    print(f"  {ATTN}: {d['treated_full']}/{d['rows']} rows treated in the full series; "
-          f"{d['treated_trunc']}/{v['n']} after truncation, leaving {v['n'] - d['treated_trunc']} controls")
+    print(f"  {ATTN}: {d['treated_full']}/{d['rows']} rows treated, so no control rows exist for it")
     _print_hyps(attribute_dr(res, fx.graph), v)
 
 
@@ -220,10 +230,8 @@ def scenario_3() -> tuple[Residuals, object]:
     print("\n  3a. full trace (lm_head included)")
     v = _view(res)
     _print_view(v)
-    kept = attn[:v["n"]]
-    print(f"  the {v['n']} {ATTN} rows that survive truncation are steps "
-          f"{sorted({i // n_layers for i in range(v['n'])})}, layers {[k.layer for k in kept]}, "
-          f"r_kt {[round(k.r_kt, 4) for k in kept]}")
+    print(f"  pairs are aligned per pair, so {ATTN} keeps its {len(attn)} rows against each effect "
+          f"op's own length; lm_head (8 rows) is incomparable with it and is not paired")
     _print_hyps(attribute_dr(res, fx.graph), v)
 
     print("\n  3b. same trace with every lm_head row removed")
@@ -328,12 +336,13 @@ def scenario_6(per_seed: bool) -> None:
     _sweep_summary("primary, 40 rows", AR1_SEEDS, [_ar1_via_attribute_dr(s) for s in AR1_SEEDS], per_seed)
 
 
-def _zero_se_rows(cause: str, ranked, series: dict, n: int) -> None:
-    t = (np.abs(np.asarray(series[cause][:n])) > BAND).astype(float)
-    pos = np.arange(n, dtype=float)
+def _zero_se_rows(cause: str, ranked, series: dict, n: int | None = None) -> None:
     by_pair = {(h.cause_op, h.effect_op): h for h in ranked.hypotheses}
     for effect in [op for op in series if op != cause]:
-        y = np.asarray(series[effect][:n], dtype=float)
+        m = min(len(series[cause]), len(series[effect])) if n is None else n
+        t = (np.abs(np.asarray(series[cause][:m])) > BAND).astype(float)
+        pos = np.arange(m, dtype=float)
+        y = np.asarray(series[effect][:m], dtype=float)
         ate, se = doubly_robust_ate(y, t, pos)
         z = ate / se if se not in (0.0, float("inf")) else 0.0
         h = by_pair.get((cause, effect))
@@ -349,7 +358,7 @@ def scenario_7(no_lm: Residuals, v: dict) -> None:
     print("  7a. scenario 3b's input: every effect series is one constant value")
     graph = _fixture([mf.RegionSlowdown(1.0, ops={ATTN}, steps={2, 3})]).graph
     series = {op: v["series"][op] for op in v["ops"]}
-    _zero_se_rows(ATTN, attribute_dr(no_lm, graph), series, v["n"])
+    _zero_se_rows(ATTN, attribute_dr(no_lm, graph), series)
 
     print(f"\n  7b. constructed: A as in scenario 5 with seed {ZERO_SE_SEED}; B is exactly 0.0 on all 40 rows")
     rng = np.random.default_rng(ZERO_SE_SEED)
@@ -361,6 +370,8 @@ def scenario_7(no_lm: Residuals, v: dict) -> None:
     _print_view(vb)
     ranked = attribute_dr(res, predict_graph())
     _print_hyps(ranked, vb)
+    print(f"  since #137 an exactly-zero se is rejected rather than listed: "
+          f"failures={dict(ranked.failures)}; the cross-check above is expected to be False here")
     _zero_se_rows("A", ranked, {"A": a, "B": b}, 40)
 
 
