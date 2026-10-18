@@ -237,3 +237,162 @@ def test_random_ranking_does_not_mutate_its_inputs_or_the_global_rng():
     assert [s.model_dump() for s in lib] == lib_before
     assert [id(s) for s in lib] == ids_before
     assert (policy.require_qualification_commit, policy.skip_high_risk, policy.use_history) == policy_before
+
+
+# --- baseline 1: exact match -------------------------------------------------
+
+from datetime import datetime, timezone  # noqa: E402
+
+from gitm.playbook.schema import (  # noqa: E402
+    EnvCapture, Evidence, Invalidation, MeasuredDelta, Playbook, PlaybookRow, Provenance, RowIdentity,
+)
+from gitm.research.distance_metric.baselines import (  # noqa: E402
+    bottleneck_keyword_ranking, exact_match_ranking,
+)
+from gitm.tracer.schema import MemcpyEvent  # noqa: E402
+from gitm.traffic.regime import Regime, SourceKind  # noqa: E402
+
+_T0 = datetime(2026, 9, 2, tzinfo=timezone.utc)
+_ENV = EnvCapture(engine="vllm", engine_version="0.11.0")
+
+
+def _regime(input_p50=4096, concurrency=64) -> Regime:
+    return Regime(source_kind=SourceKind.PRODUCTION, trace="t", requests=100, rate_rps=1.0,
+                  io_ratio=8.0, input_p50=input_p50, input_p95=input_p50 * 2, output_p50=512,
+                  output_p95=1024, burstiness=1.0, concurrency=concurrency)
+
+
+def _query(regime=None) -> RowIdentity:
+    return RowIdentity(model="m", model_revision="r", gpu_sku=SKU, env=_ENV,
+                       regime=regime or _regime(), knobs={"placeholder": 1})
+
+
+def _row(row_id, knob, value, tput, regime=None, **kw) -> PlaybookRow:
+    regime = regime or _regime()
+    return PlaybookRow(
+        row_id=row_id,
+        identity=RowIdentity(model="m", model_revision="r", gpu_sku=SKU, env=_ENV,
+                             regime=regime, knobs={knob: value}),
+        delta=MeasuredDelta(throughput_pct=tput, ttft_p99_ms=0.0, itl_p99_ms=0.0, repeats=5),
+        provenance=Provenance(trace_source="t", trace_sha256="0" * 64,
+                              regime_label=regime.label(), verified_at=_T0),
+        evidence=Evidence.MEASURED, **kw)
+
+
+def _lib_for_exact() -> list[InterventionSpec]:
+    return [_spec("lever_a", ["gemm"]), _spec("lever_b", ["gemm"]), _spec("lever_c", ["gemm"]),
+            _spec("risky", ["gemm"], tier="high_risk")]
+
+
+def test_exact_match_ranks_by_the_rows_measured_delta_and_abstains_elsewhere():
+    pb = Playbook(rows=[
+        _row("a", "lever_a", 1, 4.0),
+        _row("b", "lever_b", 1, 10.0),
+        _row("near", "lever_c", 1, 50.0, regime=_regime(input_p50=4608)),  # not exact
+    ])
+    out = exact_match_ranking(pb, _query(), _trace(), _lib_for_exact(),
+                              Policy(skip_high_risk=True), ctx=CTX)
+
+    assert out.matched == ("lever_b", "lever_a")
+    assert [c.predicted_delta for c in out.ranking[:2]] == [0.10, 0.04]
+    assert out.abstained == {"lever_c": "uncalibrated"}
+    names = [c.spec.name for c in out.ranking]
+    assert names == ["lever_b", "lever_a", "lever_c", "risky"]
+    assert out.ranking[2].rejected_reason == "no_exact_match:uncalibrated"
+    assert out.ranking[3].rejected_reason == "policy.skip_high_risk"
+    assert len(out.ranking) == 4
+
+
+def test_exact_match_ignores_invalidated_rows_and_reports_no_match():
+    pb = Playbook(rows=[_row("a", "lever_a", 1, 9.0,
+                             invalidated=Invalidation(reason="bad", at=_T0))])
+    out = exact_match_ranking(pb, _query(), _trace(), _lib_for_exact(),
+                              Policy(skip_high_risk=True), ctx=CTX)
+
+    assert out.matched == ()
+    assert set(out.abstained) == {"lever_a", "lever_b", "lever_c"}
+    assert set(out.abstained.values()) == {"no_match"}
+
+
+def test_exact_match_excludes_rows_measured_at_the_target():
+    pb = Playbook(rows=[_row("leak", "lever_a", 1, 9.0), _row("ok", "lever_b", 1, 3.0)])
+    out = exact_match_ranking(pb, _query(), _trace(), _lib_for_exact(),
+                              Policy(skip_high_risk=True), ctx=CTX,
+                              exclude_row_ids=frozenset({"leak"}))
+
+    assert out.matched == ("lever_b",)
+    assert "lever_a" in out.abstained
+
+
+def test_exact_match_abstains_on_knob_values_a_row_cannot_hold():
+    spec = _spec("dict_lever", ["gemm"])
+    spec = spec.model_copy(update={"value": {"level": 3}})
+    out = exact_match_ranking(Playbook(rows=[]), _query(), _trace(), [spec],
+                              Policy(), ctx=CTX)
+
+    assert out.abstained == {"dict_lever": "knobs_not_representable_in_a_playbook_row"}
+    assert out.matched == ()
+
+
+def test_exact_match_does_not_mutate_inputs_and_is_repeatable():
+    pb = Playbook(rows=[_row("a", "lever_a", 1, 4.0)])
+    q, lib = _query(), _lib_for_exact()
+    pb_before, q_before = pb.model_dump(), q.model_dump()
+    first = exact_match_ranking(pb, q, _trace(), lib, Policy(), ctx=CTX)
+    second = exact_match_ranking(pb, q, _trace(), lib, Policy(), ctx=CTX)
+
+    assert pb.model_dump() == pb_before and q.model_dump() == q_before
+    assert _key(first.ranking) == _key(second.ranking)
+
+
+# --- baseline 2: bottleneck / keyword ---------------------------------------
+
+def _memcpy_trace() -> Trace:
+    kernels = [KernelEvent(name="gemm_kernel", start_ns=0, end_ns=100, stream_id=7,
+                           device_id=0, correlation_id=1)]
+    copies = [MemcpyEvent(start_ns=100, end_ns=900, stream_id=8, device_id=0, correlation_id=2,
+                          bytes=1 << 20, src="host", dst="device")]
+    return Trace(workload_id="vllm-decode", fingerprint="fp", run_id="r", device_count=1,
+                 vendor="amd", captured_at_ns=0, duration_ns=900, events=kernels + copies)
+
+
+def _knob_lib() -> list[InterventionSpec]:
+    def s(name, knob):
+        return _spec(name, ["gemm"]).model_copy(update={"knob": knob})
+    return [s("z_graphs", "cuda_graph_mode"), s("a_cache", "kv_cache_dtype"),
+            s("m_chunk", "enable_chunked_prefill"), s("b_cache2", "gpu_memory_utilization"),
+            s("n_other", "tensor_parallel_size")]
+
+
+def test_bottleneck_baseline_prefers_levers_matching_the_class_keywords():
+    out = bottleneck_keyword_ranking(_memcpy_trace(), _knob_lib(), Policy(), ctx=CTX)
+
+    assert out.bottleneck_class == "memory_bound"
+    names = [c.spec.name for c in out.ranking]
+    # kv_cache_dtype matches "cache" and "kv"; gpu_memory_utilization matches
+    # "gpu_memory"; the rest match nothing and follow in name order.
+    assert names[:2] == ["a_cache", "b_cache2"]
+    assert names[2:] == ["m_chunk", "n_other", "z_graphs"]
+    assert all(c.predicted_delta == 0.0 for c in out.ranking)
+
+
+def test_bottleneck_baseline_changes_with_the_class_and_never_reads_scores():
+    mem = bottleneck_keyword_ranking(_memcpy_trace(), _knob_lib(), Policy(), ctx=CTX)
+    comp = bottleneck_keyword_ranking(_trace(), _knob_lib(), Policy(), ctx=CTX)
+
+    assert comp.bottleneck_class == "idle_stall"  # one serialized stream
+    assert [c.spec.name for c in comp.ranking][0] == "m_chunk"  # "prefill", "chunk"
+    assert [c.spec.name for c in mem.ranking] != [c.spec.name for c in comp.ranking]
+    # Same ranking whatever the catalog thinks each lever is worth.
+    rich = [s.model_copy(update={"expected_delta_mean": 0.9}) for s in _knob_lib()]
+    assert [c.spec.name for c in bottleneck_keyword_ranking(
+        _memcpy_trace(), rich, Policy(), ctx=CTX).ranking] == [c.spec.name for c in mem.ranking]
+
+
+def test_bottleneck_baseline_keeps_gate_rejections_last_and_is_complete():
+    lib = _knob_lib() + [_spec("risky", ["gemm"], tier="high_risk")]
+    out = bottleneck_keyword_ranking(_memcpy_trace(), lib, Policy(skip_high_risk=True), ctx=CTX)
+
+    assert len(out.ranking) == len(lib)
+    assert out.ranking[-1].spec.name == "risky"
+    assert out.ranking[-1].rejected_reason == "policy.skip_high_risk"
