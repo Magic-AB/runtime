@@ -73,14 +73,16 @@ example, not a dependency.
 > | E1 direction | B→A ranked first on the seed-3 fixture | A→B ranks first (ATE +0.780, se 0.017); B→A second (+1.006, se 0.011). Both p are still 0.0. |
 > | E2 truncation | every op cut to `lm_head`'s 8 rows, 0 hypotheses | pairs are aligned per pair: 4 hypotheses, `n_obs_used` 256, status `ok` |
 > | E3 empty result | one bare empty value for three situations | no anomaly and every-row-treated still return no hypotheses, now with status `insufficient_data`, the reason "no op had at least 3 out-of-band and 3 in-band samples", and `skipped_causes` (0 treated vs 256 treated). The reason text is identical for both. |
-> | E4, E5, E6 | as stated | unchanged: the seed-45 spike, AR(1) seeds 2 and 10 are still confidently wrong, and the truncation case's ATE is `+0.000 (se=0.000)`. |
+> | E4, E5 | as stated | unchanged: the seed-45 spike and AR(1) seeds 2 and 10 are still confidently wrong. |
+> | E6 near-zero se | passes the guard | still passes: scenario 7a's se is 1e-17 to 4e-17 and the pairs are listed with p from 0.0001 to 0.92. The truncation case's ATE is `+0.000 (se=0.000)`. |
+> | E6 exactly-zero se | listed, p = 1.0 | now rejected: scenario 7b returns status `failed`, failure `nonfinite_estimate`. |
 >
 > The control harness (`gitm/research/attribution_controls`) on main: `dr.py` is still
 > INVALID, with **3** wrong-confident cases of 17 (all independent series; was 4), and
 > positive identification 5/5. The rows below are kept as the record of what the
-> pre-#137 probe found at `28b7890`; `gitm/research/dr_probe.py` still prints that
-> truncation story in scenarios 1-3 and its cross-checks fail on main, so treat its
-> scenario 1-4 tables as stale until it is updated.
+> pre-#137 probe found at `28b7890`. `gitm/research/dr_probe.py` has been updated for
+> the pairwise alignment and the new status fields; its scenarios 1-4 describe main.
+> The E1-E3 numbers in the table below are the old ones.
 
 
 All rows E1-E6 are probe output at `28b7890`, run against dr.py
