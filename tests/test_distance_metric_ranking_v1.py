@@ -12,7 +12,10 @@ from gitm.research.distance_metric.baselines import catalog_predict_delta_rankin
 from gitm.research.distance_metric.config import DistanceConfig
 from gitm.research.distance_metric.features import extract_features
 from gitm.research.distance_metric.ranking_v1 import (
-    FALLBACK, TRANSFERRED, SourceMeasurement, rank_v1,
+    FALLBACK,
+    TRANSFERRED,
+    SourceMeasurement,
+    rank_v1,
 )
 from gitm.research.distance_metric.synthetic import synthetic_point
 

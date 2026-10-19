@@ -16,9 +16,9 @@ from pydantic import ValidationError
 from gitm.agents.autoresearch import _CLASS_KEYWORDS, classify_bottleneck
 from gitm.agents.policy import Policy, RankedCandidate, select_interventions
 from gitm.kernels.spec import InterventionSpec
-from gitm.optimizer.preconditions import GateContext
 from gitm.optimizer.monitor import Residuals
-from gitm.playbook.match import MatchPolicy, MatchStatus, UNCALIBRATED_POLICY, lookup
+from gitm.optimizer.preconditions import GateContext
+from gitm.playbook.match import UNCALIBRATED_POLICY, MatchPolicy, MatchStatus, lookup
 from gitm.playbook.schema import Playbook, RowIdentity
 from gitm.tracer.schema import Trace
 

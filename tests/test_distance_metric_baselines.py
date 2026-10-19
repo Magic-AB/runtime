@@ -244,10 +244,18 @@ def test_random_ranking_does_not_mutate_its_inputs_or_the_global_rng():
 from datetime import datetime, timezone  # noqa: E402
 
 from gitm.playbook.schema import (  # noqa: E402
-    EnvCapture, Evidence, Invalidation, MeasuredDelta, Playbook, PlaybookRow, Provenance, RowIdentity,
+    EnvCapture,
+    Evidence,
+    Invalidation,
+    MeasuredDelta,
+    Playbook,
+    PlaybookRow,
+    Provenance,
+    RowIdentity,
 )
 from gitm.research.distance_metric.baselines import (  # noqa: E402
-    bottleneck_keyword_ranking, exact_match_ranking,
+    bottleneck_keyword_ranking,
+    exact_match_ranking,
 )
 from gitm.tracer.schema import MemcpyEvent  # noqa: E402
 from gitm.traffic.regime import Regime, SourceKind  # noqa: E402
