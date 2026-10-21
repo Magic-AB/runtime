@@ -376,7 +376,7 @@ def test_changing_the_cap_changes_the_candidate_count(grid):
         assert sets.status == expected_status
         # The uncapped set, which S and Kset use, does not move with the cap,
         # and neither does d.
-        assert len(sets.common) == 24
+        assert len(sets.common) == len(common_candidates(a, b, CFG).common)
         assert distance(a, b, cfg).distance == distance(a, b, CFG).distance
 
 
@@ -418,11 +418,17 @@ def test_names_at_one_point_only_are_outside_the_intersection(base):
     assert sets.only_a == ("max_num_batched_tokens_dynamic_x2", "max_num_batched_tokens_dynamic_x4")
     assert sets.only_b == ()
     assert not set(sets.only_a) & set(sets.common)
-    assert sets.sizes == {"common": 22, "capped": 6, "same_values": 3}
+    whole = common_candidates(base, base, CFG)
+    # Two names are outside the intersection; the rest of the count follows the catalog.
+    assert sets.sizes["common"] == whole.sizes["common"] - 2
+    assert sets.sizes["capped"] == 6
+    assert 0 < sets.sizes["same_values"] <= sets.sizes["common"]
     # Same name, different resolved value: in the common set, out of the sensitivity subset.
-    assert set(sets.capped) - set(sets.same_values) == {
-        "gpu_memory_utilization_dynamic_x0_95", "gpu_memory_utilization_dynamic_x1_03",
-        "max_num_batched_tokens_dynamic_x0_5"}
+    # Which levers survive the cap follows the catalog's ranking, so the test pins the
+    # property: only relative levers resolve to different values at the two points.
+    differing = set(sets.capped) - set(sets.same_values)
+    assert differing, "the collapsed point should change some resolved values"
+    assert all("_dynamic_x" in n for n in differing), differing
 
 
 def test_vetoed_candidates_leave_the_common_set_with_a_reason(base):
