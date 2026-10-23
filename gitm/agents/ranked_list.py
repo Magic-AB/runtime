@@ -7,7 +7,9 @@ why each lever stands where it does.
 
 Fields read from the yaml, per lever (ENG-79 adds them; until it lands nothing has them):
 
-* ``class``: 1 accuracy-neutral (in the MVP), 2 changes numerics, 3 post-MVP;
+* ``lever_class``: 1 accuracy-neutral (in the MVP), 2 changes numerics, 3 post-MVP. ENG-79's
+  owner gave this name on Oct 23, still to be confirmed with the reviewers; a bare ``class`` is
+  accepted too, so either spelling of the field reads;
 * ``restart_cost``: ``none`` (live engine API), ``restart`` (new engine, weights reused),
   ``rebuild`` (weights re-sharded);
 * ``expected_delta_mean``, ``expected_delta_lo``, ``expected_delta_hi``.
@@ -92,7 +94,7 @@ def read_lever_meta(path: str | Path) -> dict[str, LeverMeta]:
         if name in out:
             raise ValueError(f"{path}: lever {name!r} appears twice")
         problems: list[str] = []
-        cls = item.get("class")
+        cls = item.get("lever_class", item.get("class"))
         if cls is None:
             problems.append("class_missing")
         elif isinstance(cls, bool) or cls not in CLASSES:

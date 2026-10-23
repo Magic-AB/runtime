@@ -42,7 +42,7 @@ def three(specs):
 
 
 def _meta(tmp_path, names, classes=(1, 1, 1), costs=("none", "restart", "rebuild")):
-    rows = [{"name": n, "class": c, "restart_cost": r, "expected_delta_lo": 0.01,
+    rows = [{"name": n, "lever_class": c, "restart_cost": r, "expected_delta_lo": 0.01,
              "expected_delta_hi": 0.2, "expected_delta_mean": 0.1}
             for n, c, r in zip(names, classes, costs, strict=True)]
     return read_lever_meta(_meta_file(tmp_path, rows))
@@ -129,9 +129,17 @@ def test_top_n_truncates_the_list(three, tmp_path):
     ("restart_cost", "slow", "restart_cost_invalid:'slow'"),
 ])
 def test_invalid_fields_are_recorded_not_raised(tmp_path, field, bad, reason):
-    row = {"name": "x", "class": 1, "restart_cost": "none", field: bad}
+    row = {"name": "x", "lever_class": 1, "restart_cost": "none"}
+    row["lever_class" if field == "class" else field] = bad
     meta = read_lever_meta(_meta_file(tmp_path, [row]))
     assert meta["x"].problems == (reason,)
+
+
+def test_a_bare_class_key_reads_as_lever_class_and_lever_class_wins(tmp_path):
+    meta = read_lever_meta(_meta_file(tmp_path, [
+        {"name": "a", "class": 2, "restart_cost": "none"},
+        {"name": "b", "class": 2, "lever_class": 1, "restart_cost": "none"}]))
+    assert meta["a"].lever_class == 2 and meta["b"].lever_class == 1
 
 
 def test_a_file_that_is_not_a_library_is_refused(tmp_path):
