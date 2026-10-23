@@ -158,10 +158,13 @@ class RankedList:
         return json.dumps(self.to_dict(), indent=2, sort_keys=True, allow_nan=False)
 
 
-def _why(c: RankedCandidate, m: LeverMeta | None) -> tuple[str, ...]:
+def _why(c: RankedCandidate, m: LeverMeta | None, causes: Sequence[Any] = ()) -> tuple[str, ...]:
     lines = [f"predicted delta {c.predicted_delta:+.3f} from {c.delta_source}"]
     if c.motivated_by:
         lines.append(f"this run showed {c.motivated_by}, which argues for it")
+        note = next((x.note for x in causes if x.signal == c.motivated_by), None)
+        if note:
+            lines.append(f"counters: {note}")
     if c.targets:
         ops = ", ".join(f"{op} ({s:.3f}s above floor)" for op, s in c.targets[:3])
         lines.append(f"aimed at ops losing time in this run: {ops}")
@@ -180,6 +183,7 @@ def rank_for_loop(
     mvp_classes: Iterable[int] = (1,),
     strict: bool = True,
     cost_weighted: bool = False,
+    causes: Sequence[Any] = (),
 ) -> RankedList:
     """The list the loop consumes, from ``select_interventions``'s output and the yaml fields.
 
@@ -187,6 +191,8 @@ def rank_for_loop(
     when the ranking rejected it, when it has nothing left to change (``baseline_noop``), when
     its class is outside ``mvp_classes``, or, under ``strict``, when its class or restart cost
     is missing or invalid. A lever the yaml does not mention is left out as ``not_in_meta``.
+    ``causes`` (objects with ``signal`` and ``note``, such as the scheduler causes) adds each
+    motivated lever's cause note, which carries the counters, to its ``why``.
     """
     classes = tuple(mvp_classes)
     kept: list[tuple[RankedCandidate, LeverMeta | None]] = []
@@ -224,5 +230,5 @@ def rank_for_loop(
             delta_source=c.delta_source, lever_class=m.lever_class if m else None,
             restart_cost=m.restart_cost if m else None, try_cost_s=cost(m),
             expected_delta_range=rng, motivated_by=c.motivated_by, targets=c.targets,
-            demoted=c.demoted, why=_why(c, m)))
+            demoted=c.demoted, why=_why(c, m, causes)))
     return RankedList(entries, excluded, strict, cost_weighted, classes)
