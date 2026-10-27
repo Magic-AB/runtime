@@ -14,6 +14,7 @@ import pytest
 from gitm.agents.fast_ranking import fast_evidence, rank_fast
 from gitm.agents.ranked_list import LeverMeta, read_lever_meta
 from gitm.kernels.library import load_library
+from gitm.optimizer.preconditions import GateContext
 
 LIBRARY_YAML = Path(__file__).resolve().parents[1] / "gitm/kernels/library.yaml"
 T0 = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp()
@@ -75,10 +76,45 @@ def test_motivated_levers_rank_ahead_of_a_larger_prior(library, meta):
     assert any(e.predicted_delta > entries[0].predicted_delta for e in entries[1:])
 
 
-def test_kv_pressure_is_seen_but_preemption_never_is(library, meta):
+def test_kv_pressure_without_a_preemption_counter_says_so(library, meta):
     ev = fast_evidence(rows([20] * 10, [0] * 10, [0.97] * 10))
     assert [c.signal for c in ev.causes] == ["kv_cache_pressure"]
     assert any(m.startswith("preemptions:") for m in ev.missing)
+
+
+def _preemption_rows(deltas, *, window_len=10):
+    """Scheduler rows plus the collector's one-delta-per-window preemption counter."""
+    out = rows([20] * (window_len * len(deltas)), [0] * (window_len * len(deltas)))
+    for i, d in enumerate(deltas):
+        out.append({"window_id": f"w{i}", "host_name": "h1", "key": "vllm.num_preemptions",
+                    "sample_ts": T0 + (i + 1) * window_len, "value": d})
+    return out
+
+
+def test_preemption_deltas_from_every_window_are_summed():
+    ev = fast_evidence(_preemption_rows([0, 4, 3]))
+    assert ev.counters["total_preemptions"] == 7
+    assert "kv_cache_preemption" in [c.signal for c in ev.causes]
+    assert not any(m.startswith("preemptions:") for m in ev.missing)
+
+
+def test_zero_preemption_deltas_raise_no_cause_and_are_not_reported_missing():
+    ev = fast_evidence(_preemption_rows([0, 0, 0]))
+    assert ev.counters["total_preemptions"] == 0
+    assert "kv_cache_preemption" not in [c.signal for c in ev.causes]
+    assert not any(m.startswith("preemptions:") for m in ev.missing)
+
+
+def test_timestamps_may_be_iso_strings_and_naive_times_are_utc():
+    base = rows([5, 5], [0, 0])
+    iso = [{**r, "sample_ts": datetime.fromtimestamp(r["sample_ts"], timezone.utc).isoformat()}
+           for r in base]
+    naive = [{**r, "sample_ts": datetime.fromtimestamp(r["sample_ts"], timezone.utc)
+              .replace(tzinfo=None)} for r in base]
+    want = fast_evidence(base).counters["duration_s"]
+    assert fast_evidence(iso).counters["duration_s"] == want
+    assert fast_evidence(naive).counters["duration_s"] == want
+    assert fast_evidence(iso).problems == []
 
 
 def test_sglang_rows_work_but_kv_pressure_is_listed_as_undetectable():
@@ -146,8 +182,25 @@ def test_strict_mode_with_the_real_library_returns_nothing_until_levers_are_clas
 
 def test_a_lever_that_changes_nothing_is_left_out(library, meta):
     name = "kv_cache_block_size_16"            # sets block_size to 16
-    before = rank_fast(rows([40] * 5, [0] * 5), library, meta)
+    ctx = GateContext(workload="vllm-decode", dtype="bf16")  # this lever needs a known dtype
+    before = rank_fast(rows([40] * 5, [0] * 5), library, meta, ctx=ctx)
     assert name in {e.name for e in before.ranked.entries}
-    after = rank_fast(rows([40] * 5, [0] * 5), library, meta, current_values={"block_size": 16})
+    after = rank_fast(rows([40] * 5, [0] * 5), library, meta, ctx=ctx,
+                      current_values={"block_size": 16})
     assert name not in {e.name for e in after.ranked.entries}
     assert dict(after.ranked.excluded)[name].startswith("baseline_noop")
+
+
+def test_vllm_rows_gate_out_levers_for_other_workloads(library, meta):
+    r = rank_fast(rows([20] * 10, [0] * 10), library, meta, strict=False)
+    names = [e.name for e in r.ranked.entries]
+    assert names, "the vLLM levers should still be ranked"
+    assert not any(n.startswith(("edge_", "hft_")) for n in names)
+    why = dict(r.ranked.excluded)
+    assert "not_applicable" in why["edge_fp16_autocast"]
+
+
+def test_a_lever_that_needs_a_dtype_is_excluded_until_the_dtype_is_known(library, meta):
+    r = rank_fast(rows([20] * 10, [0] * 10), library, meta, strict=False)
+    why = dict(r.ranked.excluded)
+    assert "dtype is unknown" in why["kv_cache_block_size_16"]
