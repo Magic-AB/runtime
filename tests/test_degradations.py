@@ -22,6 +22,7 @@ from gitm.optimizer.degradation import (
     AB_PROBE,
     AB_UNIT,
     AFFECTS_AB,
+    AFFECTS_CLAIMS,
     APPROXIMATE,
     AR_CATALOG,
     AR_PROPOSER,
@@ -140,8 +141,10 @@ def test_restart_ab_under_the_default_probe_is_an_error_not_a_result():
     from gitm.optimizer.apply import LiveEngineApplicator, apply_intervention
     from gitm.scheduler.loop import _engine_throughput_fn
 
-    original = SimpleNamespace(gitm_llm_kwargs={})
-    rebuilt = SimpleNamespace(gitm_llm_kwargs={})
+    # A cap that leaves room for both engines, so the restart is reachable and
+    # this stays a test about the probe rather than about memory.
+    original = SimpleNamespace(gitm_llm_kwargs={'gpu_memory_utilization': 0.4})
+    rebuilt = SimpleNamespace(gitm_llm_kwargs={'gpu_memory_utilization': 0.4})
     log = DegradationLog()
     spec = InterventionSpec.model_validate(dict(
         name="restart_test", summary="s", knob="max_num_seqs", value=64,
@@ -178,6 +181,7 @@ def test_probe_without_a_token_count_says_runs_per_second():
 
 
 def test_decode_steps_are_labelled_as_steps_not_tokens():
+    from gitm.optimizer.apply import ApplyResult
     from gitm.optimizer.verification_export import build_record
     from gitm.scheduler.loop import _ab_evidence, _engine_throughput_fn
 
@@ -192,7 +196,7 @@ def test_decode_steps_are_labelled_as_steps_not_tokens():
     text = _ab_evidence(ab, rolled_back=False, measured_under=list(log))
     assert "steps/s" in text and "tok/s" not in text
     spec = SimpleNamespace(name="l", summary="s", knob="k", value=1, source="t")
-    rec = build_record(spec, ab, SimpleNamespace(rolled_back=False), degradations=list(log))
+    rec = build_record(spec, ab, ApplyResult(True, rolled_back=False, measured_delta=0.0), degradations=list(log))
     assert rec.unit == "decode_steps/sec"
 
 
@@ -266,12 +270,47 @@ def test_graph_basis_records_model_hardware_and_batch():
     log = DegradationLog()
     with _quiet():
         _record_graph_basis(log, pctx=SimpleNamespace(peak=None, sku="Mystery GPU"),
-                            batch=None, sched=None, graph_default_why="no engine attached")
+                            batch=None, batch_source=None, sched=None,
+                            graph_default_why="no engine attached")
     by = {(d.stage, d.severity) for d in log}
     assert (GRAPH_MODEL, UNRELIABLE) in by
     assert (GRAPH_HARDWARE, APPROXIMATE) in by
-    assert (GRAPH_BATCH, APPROXIMATE) in by
     assert any("Mystery GPU" in d.reason for d in log)
+
+
+def test_defaulted_batch_is_unreliable_not_approximate():
+    """A batch-1 ceiling on a real serving window is ~30x under the floor, so
+    residuals against it are noise — the same class as the wrong model, not a
+    stated default with error bars."""
+    from gitm.scheduler.loop import _record_graph_basis
+
+    log = DegradationLog()
+    with _quiet():
+        _record_graph_basis(log, pctx=SimpleNamespace(peak=object(), sku="MI355X"),
+                            batch=None, batch_source=None,
+                            sched=SimpleNamespace(n_samples=40),
+                            graph_default_why=None)
+    batch = [d for d in log if d.stage == GRAPH_BATCH and d.used == "batch=1"]
+    assert len(batch) == 1
+    assert batch[0].severity == UNRELIABLE
+    assert AFFECTS_CLAIMS in batch[0].affects
+    # It got samples, so the reason must not claim there were none.
+    assert "no scheduler samples" not in batch[0].reason
+
+
+def test_batch_from_in_flight_requests_is_recorded_as_approximate():
+    """An observed-but-bounded batch is a real measurement with a stated caveat,
+    so it must not be logged at the same severity as having no batch at all."""
+    from gitm.scheduler.loop import _record_graph_basis
+
+    log = DegradationLog()
+    with _quiet():
+        _record_graph_basis(log, pctx=SimpleNamespace(peak=object(), sku="MI355X"),
+                            batch=SimpleNamespace(batch=31), batch_source="unfinished",
+                            sched=SimpleNamespace(n_samples=40), graph_default_why=None)
+    by = {(d.stage, d.severity) for d in log}
+    assert (GRAPH_BATCH, UNRELIABLE) not in by
+    assert any("batch=31" in d.used for d in log)
 
 
 # ── scope: a degradation belongs to the A/B it happened during ───────────────
@@ -408,7 +447,7 @@ def test_report_counts_the_good_claims_and_marks_only_the_bad_one():
                                       affects=(AFFECTS_AB,), scope="late")])
     md = write_report([_claim("early"), _claim("late", [AB_PROBE])], _provenance(log))
     assert "## Degradations" in md and "[during late]" not in md  # rendered from dicts
-    assert "1 verified claims" in md and "1 more not counted" in md
+    assert "1 claim(s) kept on a measured A/B" in md and "1 more not counted" in md
     assert md.count("(unreliable A/B: ") == 1
 
 
@@ -434,17 +473,18 @@ def test_a_clean_report_has_no_degradations_section():
 def test_verification_records_carry_their_own_degradations_and_unit():
     from types import SimpleNamespace as NS
 
+    from gitm.optimizer.apply import ApplyResult
     from gitm.optimizer.verification_export import build_export, build_record
 
     spec = NS(name="lever", summary="s", knob="k", value=1, source="t")
     ab = NS(baseline_tps=1.0, candidate_tps=1.1, speedup=1.1, baseline_std=0.0,
             candidate_std=0.0, reps=1, rel_std=0.0, significant=True, via="hot-swap")
     unit = Degradation(AB_UNIT, used="runs/sec", reason="r", affects=(AFFECTS_AB,))
-    rec = build_record(spec, ab, NS(rolled_back=False), degradations=[unit])
+    rec = build_record(spec, ab, ApplyResult(True, rolled_back=False, measured_delta=0.0), degradations=[unit])
     assert rec.degradations[0]["stage"] == AB_UNIT
     doc = build_export([rec], _provenance(DegradationLog()))
     assert doc["results"][0]["unit"] == "runs/sec" and "`unit`" in doc["protocol"]["metric"]
-    clean = build_record(spec, ab, NS(rolled_back=False))
+    clean = build_record(spec, ab, ApplyResult(True, rolled_back=False, measured_delta=0.0))
     assert build_export([clean], _provenance(DegradationLog()))["results"][0]["unit"] == "tokens/sec"
 
 
@@ -519,7 +559,7 @@ def test_unscoped_search_is_recorded_but_target_is_kept():
 # ── end to end ───────────────────────────────────────────────────────────────
 
 
-def test_every_run_writes_degradations_and_summarises_them(tmp_path: Path):
+def test_every_run_writes_degradations_and_summarises_them(tmp_path: Path, without_vllm):
     from gitm import optimize
 
     with _quiet():

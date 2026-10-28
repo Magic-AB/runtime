@@ -92,6 +92,15 @@ class VerificationRecord:
     #: What ``baseline_tps`` / ``candidate_tps`` count, from this record's own
     #: degradations: another record's fallback says nothing about this one.
     unit: str = "tokens/sec"
+    #: ``[baseline_tps, candidate_tps]`` per validation round. One entry is a
+    #: single A/B; ``speedup`` is the mean of the rounds' ratios.
+    rounds: list[list[float]] = field(default_factory=list)
+    #: The mean gain this candidate had to beat to be kept, and the A/A noise
+    #: floor it came from (``None``: no A/A sample yet, a stand-in was used).
+    #: Records from before validation existed carry neither, which is how a
+    #: reader tells a keep at ">= 0" from a keep above measured noise.
+    threshold: float | None = None
+    noise_floor: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -129,12 +138,16 @@ def build_record(
         agreement_band=max(ab.rel_std, MIN_NOISE_BAND),
         significant=ab.significant,
         # The gate decides, not the measurement — see the module docstring.
-        kept=not apply_result.rolled_back,
+        kept=apply_result.kept,
         via=ab.via,
         baseline_config=dict(baseline_config or {}),
         candidate_config=dict(candidate_config or {}),
         degradations=degradations,
         unit=AB_UNITS[ab_unit(degradations)][2],
+        rounds=[list(r) for r in (getattr(ab, "rounds", None)
+                                  or ((ab.baseline_tps, ab.candidate_tps),))],
+        threshold=getattr(ab, "threshold", None),
+        noise_floor=getattr(ab, "noise_floor", None),
     )
 
 
