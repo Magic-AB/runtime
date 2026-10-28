@@ -191,3 +191,21 @@ def test_enough_outputs_are_still_compared(envelope, baseline):
     res = detect_shift(baseline, _window(envelope, 1))
     assert "output_length" in res.components
     assert not any(r.startswith("output_not_compared") for r in res.reasons)
+
+
+def test_the_windows_own_burstiness_raises_the_bar_for_the_rate(envelope):
+    """A clumpy window's request count is far noisier than Poisson, so the same count
+    difference clears the bar for a smooth window and not for a clumpy one."""
+    hist = tuple([0] * 18 + [400] + [0] * (N_BINS - 19))
+    base = TrafficProfile(requests=400, span_s=100.0, input_hist=hist, output_hist=hist,
+                          dispersion=1.0)
+
+    def window(dispersion):
+        return TrafficProfile(requests=600, span_s=100.0, input_hist=tuple(
+            int(x * 1.5) for x in hist), output_hist=tuple(int(x * 1.5) for x in hist),
+            dispersion=dispersion)
+
+    smooth, clumpy = detect_shift(base, window(1.0)), detect_shift(base, window(25.0))
+    assert smooth.shifted
+    assert clumpy.noise_floor > smooth.noise_floor
+    assert not clumpy.shifted

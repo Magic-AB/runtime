@@ -18,7 +18,7 @@ A fixed threshold would fire on a short matched window and sleep through a long
 shifted one. So the threshold actually used is the larger of the configured threshold
 and the ``null_quantile`` of the distance a same-shaped window of the same size would
 show by chance, simulated from the baseline (multinomial for the histograms, a normal
-approximation to the request count scaled by the baseline's index of dispersion for the
+approximation to the request count scaled by each side's own index of dispersion for the
 rate). Both the window and the baseline are treated as finite samples, so a short
 baseline raises the bar as well as a short window. A window or baseline with fewer than
 ``min_requests`` requests is ``inconclusive``. Output lengths are compared only when both
@@ -278,13 +278,16 @@ def _noise_floor(baseline: TrafficProfile, window: TrafficProfile, config: Shift
     nb_in, nw_in = sum(baseline.input_hist), sum(window.input_hist)
     nb_out, nw_out = sum(baseline.output_hist), sum(window.output_hist)
     has_out = min(nb_out, nw_out) >= config.min_requests
-    rate, disp = baseline.rate_rps, max(baseline.dispersion, 1e-9)
+    # Same mean rate under the null, but each side's request count is as noisy as that side's own
+    # arrivals: a clumpy window against a smooth baseline is not a Poisson count.
+    rate = baseline.rate_rps
+    disp_b, disp_w = max(baseline.dispersion, 1e-9), max(window.dispersion, 1e-9)
     mean_b, mean_w = rate * baseline.span_s, rate * window.span_s
     zeros = np.zeros(N_BINS)
     draws = []
     for _ in range(config.null_draws):
-        count_b = max(rng.normal(mean_b, math.sqrt(disp * mean_b)), 0.0)
-        count_w = max(rng.normal(mean_w, math.sqrt(disp * mean_w)), 0.0)
+        count_b = max(rng.normal(mean_b, math.sqrt(disp_b * mean_b)), 0.0)
+        count_w = max(rng.normal(mean_w, math.sqrt(disp_w * mean_w)), 0.0)
         comps = _components(
             count_b / baseline.span_s, count_w / window.span_s,
             rng.multinomial(nb_in, p_in), rng.multinomial(nw_in, p_in),
