@@ -126,3 +126,13 @@ def test_the_trace_writes_as_a_replayable_timed_trace(tmp_path):
     plan = write_timed_trace(t, out)
     assert out.exists() and out.stat().st_size > 0
     assert plan is not None
+
+
+def test_the_command_writes_a_replay_file_and_prints_the_bench_command(tmp_path, capsys):
+    from gitm.traffic.varying import main
+
+    out = tmp_path / "v.jsonl"
+    assert main(["--seed", "1", "--out", str(out), "--model", "some/model"]) == 0
+    text = capsys.readouterr().out
+    assert out.exists() and "vllm bench serve" in text and "some/model" in text
+    assert "PASS" in text and "not run" in text

@@ -13,10 +13,18 @@ different and the matching stretches the same.
 
 Everything is seeded; the same ``seed`` and phases give the same trace, and
 ``TraceMeta.sha256`` pins it to the generating parameters.
+
+To get a replay file and the command that replays it against a server::
+
+    python -m gitm.traffic.varying --seed 0 --out varying.jsonl --model Qwen/Qwen3-8B
+
+That writes the timed trace, checks it round-trips, and prints the ``vllm bench serve``
+command. It launches nothing; run the printed command on a box that has vLLM and a server.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -142,3 +150,35 @@ def slice_trace(trace: Trace, start_s: float, end_s: float) -> Trace:
         rows_read=len(kept), rows_emitted=len(kept), span_s=end_s - start_s,
         notes=[f"window {start_s:.0f}-{end_s:.0f}s of {trace.meta.path}"])
     return Trace(meta=meta, requests=kept)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Write the varying trace as a timed trace and print the command that replays it."""
+    from gitm.traffic.replay import read_timed_trace, write_timed_trace
+    from gitm.traffic.validate import REPLAY_THRESHOLDS, compare
+
+    ap = argparse.ArgumentParser(prog="python -m gitm.traffic.varying")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", default="varying.jsonl")
+    ap.add_argument("--model", default="MODEL")
+    ap.add_argument("--tokenizer", default=None)
+    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    a = ap.parse_args(argv)
+
+    trace = varying_trace(seed=a.seed)
+    print(trace.meta.summary())
+    for note in trace.meta.notes:
+        print(f"  note: {note}")
+    plan = write_timed_trace(trace, a.out)
+    print(f"\nwrote {plan.path} ({plan.requests} requests)")
+    report = compare(trace, read_timed_trace(a.out), thresholds=REPLAY_THRESHOLDS)
+    print()
+    print(report.render())
+    cmd = plan.bench_serve_argv(model=a.model, base_url=a.base_url, tokenizer=a.tokenizer)
+    print("\n" + " ".join(cmd))
+    print("\n(not run: this launches nothing; replay it on a box with vLLM and a server)")
+    return 0 if report.passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
