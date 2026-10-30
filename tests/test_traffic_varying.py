@@ -136,3 +136,15 @@ def test_the_command_writes_a_replay_file_and_prints_the_bench_command(tmp_path,
     text = capsys.readouterr().out
     assert out.exists() and "vllm bench serve" in text and "some/model" in text
     assert "PASS" in text and "not run" in text
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_the_default_trace_survives_the_timed_trace_round_trip(tmp_path, seed):
+    from gitm.traffic.replay import read_timed_trace
+    from gitm.traffic.validate import REPLAY_THRESHOLDS, compare
+
+    t = varying_trace(seed=seed)
+    out = tmp_path / "v.jsonl"
+    write_timed_trace(t, out)
+    report = compare(t, read_timed_trace(out), thresholds=REPLAY_THRESHOLDS)
+    assert report.passed, report.render()

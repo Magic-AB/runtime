@@ -123,7 +123,8 @@ def varying_trace(
     if not reqs:
         raise ValueError("the phases produced no requests")
     base = reqs[0].arrival_s  # arrival_s is seconds from the first row
-    reqs = [CanonicalRequest(arrival_s=r.arrival_s - base, input_tokens=r.input_tokens,
+    # Rounded to the timed-trace file's precision, so writing and re-reading changes nothing.
+    reqs = [CanonicalRequest(arrival_s=round(r.arrival_s - base, 6), input_tokens=r.input_tokens,
                              output_tokens=r.output_tokens) for r in reqs]
     spec = json.dumps({"seed": seed, "phases": [asdict(p) for p in phases]}, sort_keys=True)
     meta = TraceMeta(
