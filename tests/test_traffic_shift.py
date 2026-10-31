@@ -209,3 +209,64 @@ def test_the_windows_own_burstiness_raises_the_bar_for_the_rate(envelope):
     assert smooth.shifted
     assert clumpy.noise_floor > smooth.noise_floor
     assert not clumpy.shifted
+
+
+# --- pair_distance: the raw distance with a caller-set cutoff (what ENG-183 asked for) ---
+
+
+def _poisson_profile(requests, span_s, in_mult=1.0):
+    base = [0] * N_BINS
+    base[18], base[19], base[20] = 25, 50, 25
+    hist = tuple(int(x * requests / 100 * (1.0 if in_mult == 1.0 else 1.0)) for x in base)
+    if in_mult != 1.0:  # the same shape moved two bins up
+        shifted = [0] * N_BINS
+        for i, v in enumerate(hist):
+            shifted[min(i + 2, N_BINS - 1)] += v
+        hist = tuple(shifted)
+    return TrafficProfile(requests=requests, span_s=span_s, input_hist=hist,
+                          output_hist=tuple([0] * 18 + [requests] + [0] * (N_BINS - 19)))
+
+
+def test_pair_distance_is_returned_where_detect_shift_says_inconclusive():
+    from gitm.traffic.shift import pair_distance
+
+    small = _poisson_profile(60, 60.0)
+    base = _poisson_profile(400, 100.0)
+    assert detect_shift(base, small).status == INCONCLUSIVE
+    pd = pair_distance(base, small)
+    assert pd.distance >= 0 and not pd.enough_data and pd.n_window == 60
+    assert pd.noise_floor > 0
+
+
+def test_pair_distance_agrees_with_detect_shift_when_there_is_enough_data():
+    from gitm.traffic.shift import pair_distance
+
+    base = _poisson_profile(400, 100.0)
+    for win in (_poisson_profile(400, 100.0), _poisson_profile(400, 100.0, in_mult=2.0)):
+        r, pd = detect_shift(base, win), pair_distance(base, win)
+        assert pd.enough_data
+        assert pd.distance == pytest.approx(r.distance)
+        assert pd.similar == (r.status == STABLE)
+        assert pd.noise_floor == pytest.approx(r.noise_floor)
+
+
+def test_the_cutoff_is_the_callers_to_set():
+    from gitm.traffic.shift import pair_distance
+
+    base = _poisson_profile(400, 100.0)
+    moved = _poisson_profile(400, 100.0, in_mult=2.0)
+    tight, loose = pair_distance(base, moved, cutoff=0.05), pair_distance(base, moved, cutoff=0.99)
+    assert tight.distance == loose.distance  # the raw number does not depend on the cutoff
+    assert not tight.similar and loose.similar
+
+
+def test_pair_distance_refuses_empty_windows_and_a_bad_cutoff():
+    from gitm.traffic.shift import pair_distance
+
+    base = _poisson_profile(400, 100.0)
+    empty = TrafficProfile(requests=0, span_s=10.0, input_hist=tuple([0] * N_BINS),
+                           output_hist=tuple([0] * N_BINS))
+    with pytest.raises(ValueError):
+        pair_distance(base, empty)
+    with pytest.raises(ValueError):
+        pair_distance(base, base, cutoff=0.0)

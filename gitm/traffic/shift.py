@@ -49,8 +49,8 @@ from gitm.traffic.regime import index_of_dispersion
 from gitm.traffic.schema import Trace
 
 __all__ = [
-    "N_BINS", "ShiftConfig", "ShiftResult", "TrafficProfile",
-    "detect_shift", "distance_components", "SHIFTED", "STABLE", "INCONCLUSIVE",
+    "N_BINS", "PairDistance", "ShiftConfig", "ShiftResult", "TrafficProfile",
+    "detect_shift", "distance_components", "pair_distance", "SHIFTED", "STABLE", "INCONCLUSIVE",
 ]
 
 SHIFTED = "shifted"
@@ -296,6 +296,59 @@ def _noise_floor(baseline: TrafficProfile, window: TrafficProfile, config: Shift
             config.min_requests)
         draws.append(max(comps.values()))
     return float(np.quantile(draws, config.null_quantile))
+
+
+@dataclass(frozen=True)
+class PairDistance:
+    """The raw distance between two windows, for a caller that sets its own cutoff.
+
+    ``distance`` is the largest of the per-axis distances, each in [0, 1] (0 = identical),
+    computed whatever the window sizes. A short window's distance is mostly sampling noise, so
+    the result also carries what noise alone would produce for samples of these sizes:
+    ``noise_floor`` is the ``null_quantile`` of the distance two same-shape samples of these
+    sizes show by chance. ``similar`` applies the same rule :func:`detect_shift` uses,
+    ``distance <= max(cutoff, noise_floor)``; ``enough_data`` says whether both windows reached
+    ``config.min_requests`` (below that, treat ``similar`` as unreliable).
+    """
+
+    distance: float
+    components: dict[str, float]
+    limiting_axis: str
+    n_baseline: int
+    n_window: int
+    noise_floor: float
+    cutoff: float
+    similar: bool
+    enough_data: bool
+
+
+def pair_distance(
+    baseline: TrafficProfile, window: TrafficProfile, *, cutoff: float = 0.25,
+    config: ShiftConfig | None = None,
+) -> PairDistance:
+    """The distance between two windows, always, with the noise and a caller-set cutoff.
+
+    Unlike :func:`detect_shift` this never answers "inconclusive": it returns the number and
+    leaves the call to the caller. ``cutoff`` is the distance the caller calls "similar"
+    (0.25 is the detector's default, not calibrated on real traffic); the noise floor is applied
+    on top of it, so a short window cannot be called different by noise alone.
+    """
+    config = config or ShiftConfig()
+    if not 0 < cutoff < 1:
+        raise ValueError("cutoff must be in (0, 1)")
+    if baseline.requests < 1 or window.requests < 1:
+        raise ValueError("both windows need at least one request")
+    if baseline.span_s <= 0 or window.span_s <= 0:
+        raise ValueError("both windows need a positive span")
+    comps = distance_components(baseline, window, config.min_requests)
+    axis = max(comps, key=comps.__getitem__)
+    d = comps[axis]
+    floor = _noise_floor(baseline, window, config)
+    return PairDistance(
+        distance=d, components=comps, limiting_axis=axis, n_baseline=baseline.requests,
+        n_window=window.requests, noise_floor=floor, cutoff=cutoff,
+        similar=d <= max(cutoff, floor),
+        enough_data=min(baseline.requests, window.requests) >= config.min_requests)
 
 
 def detect_shift(
