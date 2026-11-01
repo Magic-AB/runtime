@@ -18,6 +18,7 @@ import pytest
 
 from gitm.kernels.library import load_library
 from gitm.optimizer.harness_results import (
+    TRACING_NVTX_UNKNOWN,
     CaptureError,
     compare,
     fingerprint_of,
@@ -464,3 +465,268 @@ def test_the_export_does_not_claim_a_gate_that_never_ran(tmp_path):
         assert protocol[field].startswith("per record"), f"{field} is stated as a blanket claim"
     assert "requests/sec" in protocol["metric"]
     assert "measured delta" in protocol["kept"]
+
+
+# --------------------------------------------------------------------------- #
+# an attached capture, which records what it found rather than what it launched #
+# --------------------------------------------------------------------------- #
+def _attach_arm(root, name, *, cmdline, rps=40.0, traceable=True, model="Kimi-K2.5"):
+    """A directory in the shape `gitm capture attach` writes it.
+
+    No `serve_argv` and no `tracing`: attach did not launch the server, so it
+    records what it read out of /proc under `target` instead.
+    """
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    write_trace_jsonl(d / "trace.jsonl", _trace())
+    (d / "serving_summary.json").write_text(json.dumps({
+        "mode": "drive", "wall_s": 300.0,
+        "client": {"latency_source": "client", "n_failed_requests": 0,
+                   "n_requests": 512, "goodput_rps": rps, "window_s": 300.0},
+    }))
+    (d / "run_manifest.json").write_text(json.dumps({
+        "workload_id": "vllm-attach", "capture_mode": "attach",
+        "served_model": model, "load": LOAD,
+        "target": {"pid": 1234, "cmdline": cmdline, "traceable": traceable},
+    }))
+    return d
+
+
+SERVE_CMD = ["/usr/bin/python", ".venv/bin/vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct",
+             "--port", "8000", "--enforce-eager"]
+
+
+def test_an_attached_capture_reports_the_flags_the_server_was_running(tmp_path):
+    """`serve_argv` is the shape `capture serve` writes. Reading only that left
+    every attached baseline with no flags at all — and the baseline's flags are
+    what every proposed arm is built from."""
+    cap = read_capture(_attach_arm(tmp_path, "attached", cmdline=SERVE_CMD))
+    assert cap.serve_argv == ("--port", "8000", "--enforce-eager")
+
+
+def test_everything_up_to_serve_is_dropped(tmp_path):
+    """The interpreter, the console script, the subcommand and the positional
+    model are how the server was invoked, not what it was configured with, and
+    knob_difference compares flags."""
+    cap = read_capture(_attach_arm(tmp_path, "a", cmdline=SERVE_CMD))
+    assert not any(tok in cap.serve_argv for tok in
+                   ("/usr/bin/python", ".venv/bin/vllm", "serve",
+                    "Qwen/Qwen2.5-0.5B-Instruct"))
+
+
+def test_a_flag_removal_lever_is_reachable_against_an_attached_baseline(tmp_path):
+    """The sharp end. `cuda_graphs_enable` is realised by *removing*
+    `--enforce-eager`, so an empty baseline reported it unreachable on a server
+    that was started with it."""
+    base = read_capture(_attach_arm(tmp_path, "base", cmdline=SERVE_CMD))
+    cand = read_capture(_attach_arm(
+        tmp_path, "cand", rps=50.0,
+        cmdline=[*SERVE_CMD[:-1]]))          # same, minus --enforce-eager
+
+    knobs = knob_difference(base, cand)
+    assert knobs == {"--enforce-eager": None}
+    assert resolve_lever("--enforce-eager", None, LIB).name == "cuda_graphs_enable"
+
+
+def test_tracing_says_what_the_manifest_establishes_and_no_more(tmp_path):
+    """An attach target records `traceable` and nothing about markers, so
+    "cupti" would be a claim that NVTX was *off*. A traced arm with markers and
+    one without would then compare as though they matched, and the marker
+    overhead would land on whatever knob was under test."""
+    on = read_capture(_attach_arm(tmp_path, "on", cmdline=SERVE_CMD))
+    off = read_capture(_attach_arm(tmp_path, "off", cmdline=SERVE_CMD, traceable=False))
+    assert on.tracing == TRACING_NVTX_UNKNOWN
+    assert on.tracing not in ("cupti", "cupti+nvtx")
+    assert off.tracing == "off"
+
+
+def test_two_attached_arms_compare_but_an_attached_and_a_launched_one_do_not(tmp_path):
+    """The label equals itself, so the common case still works; it equals
+    neither tracing mode a launched capture reports, so that pairing is refused
+    rather than quietly compared."""
+    a = read_capture(_attach_arm(tmp_path, "a", cmdline=SERVE_CMD))
+    b = read_capture(_attach_arm(tmp_path, "b", cmdline=SERVE_CMD, rps=50.0))
+    assert a.comparable_key == b.comparable_key
+
+    launched = _arm(tmp_path, "launched", argv=["--port", "8000", "--enforce-eager"],
+                    tracing="cupti")
+    assert read_capture(launched).comparable_key != a.comparable_key
+
+
+@pytest.mark.parametrize("cmdline,expected", [
+    # Console script: the shebang puts the interpreter at argv[0].
+    (["/usr/bin/python", ".venv/bin/vllm", "serve", "Kimi-K2.5",
+      "--port", "8000", "--enforce-eager"],
+     ("--port", "8000", "--enforce-eager")),
+    # Module form, which discovery supports and which has no `serve` token.
+    (["/usr/bin/python", "-m", "vllm.entrypoints.openai.api_server",
+      "--model", "Kimi-K2.5", "--port", "8000"],
+     ("--model", "Kimi-K2.5", "--port", "8000")),
+    # A launcher brings its own options, and they come first.
+    (["torchrun", "--nproc-per-node", "2", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"],
+     ("--model", "Kimi-K2.5")),
+    # A profiler wrapper, same shape with a `--` separator of its own.
+    (["nsys", "profile", "-o", "out", "--", "python", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"],
+     ("--model", "Kimi-K2.5")),
+])
+def test_the_flags_start_after_the_vllm_entry_point(tmp_path, cmdline, expected):
+    """Everything before is how the server was invoked; everything after is what
+    it was configured with.
+
+    Two cheaper anchors are both wrong. A `serve` token misses the module form
+    entirely. The first `--` picks up the launcher's own options — under
+    torchrun it starts at `--nproc-per-node`, and a proposed arm would hand the
+    server a flag it has never heard of.
+    """
+    cap = read_capture(_attach_arm(tmp_path, "arm", cmdline=cmdline))
+    assert cap.serve_argv == expected
+
+
+def test_a_command_line_that_is_not_vllm_yields_no_flags(tmp_path):
+    cap = read_capture(_attach_arm(
+        tmp_path, "other", cmdline=["python", "train.py", "--lr", "0.1"]))
+    assert cap.serve_argv == ()
+
+
+def test_a_manifest_with_neither_shape_yields_no_flags_rather_than_raising(tmp_path):
+    d = tmp_path / "bare"
+    d.mkdir()
+    write_trace_jsonl(d / "trace.jsonl", _trace())
+    (d / "serving_summary.json").write_text(json.dumps({
+        "mode": "drive", "wall_s": 1.0,
+        "client": {"latency_source": "client", "n_failed_requests": 0,
+                   "n_requests": 1, "goodput_rps": 1.0, "window_s": 1.0}}))
+    (d / "run_manifest.json").write_text(json.dumps({"served_model": "m", "load": LOAD}))
+    cap = read_capture(d)
+    assert cap.serve_argv == () and cap.tracing is None
+
+
+def test_a_launched_capture_still_wins_on_its_own_field(tmp_path):
+    """serve_argv is authoritative where it exists; the /proc fallback is only
+    for the path that has none."""
+    d = _attach_arm(tmp_path, "both", cmdline=SERVE_CMD)
+    m = json.loads((d / "run_manifest.json").read_text())
+    m["serve_argv"] = ["--tensor-parallel-size", "2"]
+    (d / "run_manifest.json").write_text(json.dumps(m))
+    assert read_capture(d).serve_argv == ("--tensor-parallel-size", "2")
+
+
+# --------------------------------------------------------------------------- #
+# the launch command, kept apart from the flags arms are compared on           #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("cmdline,expected", [
+    # A console script at any path becomes `vllm`, so the arm runs anywhere.
+    (SERVE_CMD, ("vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct", "--port", "8000",
+                 "--enforce-eager")),
+    # A module keeps its module, run through `python -m`.
+    (["/usr/bin/python", "-m", "vllm.entrypoints.openai.api_server",
+      "--model", "Kimi-K2.5", "--port", "8000"],
+     ("python", "-m", "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5",
+      "--port", "8000")),
+    # Interpreter options change how the server runs, so a module launch keeps
+    # them, and the arms run under the same settings as the baseline.
+    (["/usr/bin/python3.12", "-O", "-m", "vllm.entrypoints.openai.api_server",
+      "--model", "Kimi-K2.5"],
+     ("python", "-O", "-m", "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5")),
+    # An option that takes its value as the next token keeps it.
+    (["/usr/bin/python3", "-X", "dev", "-W", "ignore", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"],
+     ("python", "-X", "dev", "-W", "ignore", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5")),
+    # `vllm` takes no interpreter options, so a console script run under them
+    # has no faithful command.
+    (["/usr/bin/python3.12", "-u", ".venv/bin/vllm", "serve", "Kimi-K2.5"], ()),
+    # A launcher shaped how the server ran. Dropping it would start a different
+    # layout from the baseline, so there is no command rather than a wrong one.
+    (["torchrun", "--nproc-per-node", "2", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"], ()),
+    (["nsys", "profile", "-o", "out", "--", "python", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"], ()),
+])
+def test_an_attached_capture_keeps_a_command_that_starts_the_server(
+        tmp_path, cmdline, expected):
+    """An arm is a command the harness runs. Built from the flags alone it
+    started nothing: the entry point and the positional model were gone."""
+    cap = read_capture(_attach_arm(tmp_path, "a", cmdline=cmdline))
+    assert cap.launch_argv == expected
+
+
+def test_a_launched_capture_launches_with_the_command_it_recorded(tmp_path):
+    argv = ["vllm", "serve", "Kimi-K2.5", "--tensor-parallel-size", "8"]
+    cap = read_capture(_arm(tmp_path, "launched", argv=argv))
+    assert cap.launch_argv == tuple(argv) == cap.serve_argv
+
+
+def test_a_boolean_flag_never_takes_the_next_token_as_its_value():
+    """`vllm serve --enforce-eager CHECKPOINT` is valid. Read by lookahead alone
+    the checkpoint became --enforce-eager's value, so removing the flag for
+    cuda_graphs_enable removed the checkpoint with it. The catalogue says which
+    flags are boolean, so the parser asks it rather than guessing the model."""
+    from gitm.optimizer.harness_results import boolean_flags, parse_flags
+
+    assert "--enforce-eager" in boolean_flags(LIB)
+    argv = ["vllm", "serve", "--enforce-eager", "/ckpt/kimi", "--port", "8000"]
+    assert parse_flags(argv, booleans=boolean_flags(LIB)) == [
+        (2, "--enforce-eager", True), (4, "--port", "8000")]
+
+
+def test_an_aliased_model_still_parses():
+    """The served name can be an alias. Treating it as the model, as the first
+    version of this did, stopped it being read as --served-model-name's value."""
+    from gitm.optimizer.harness_results import boolean_flags, parse_flags
+
+    argv = ["vllm", "serve", "--enforce-eager", "/ckpt/kimi",
+            "--served-model-name", "kimi"]
+    assert parse_flags(argv, booleans=boolean_flags(LIB)) == [
+        (2, "--enforce-eager", True), (4, "--served-model-name", "kimi")]
+
+
+def test_an_arm_removing_a_flag_keeps_the_checkpoint_that_follows_it():
+    from gitm.optimizer.experiment_specs import plan_arms
+    from gitm.optimizer.harness_results import boolean_flags
+
+    base = ["vllm", "serve", "--enforce-eager", "/ckpt/kimi",
+            "--served-model-name", "kimi"]
+    lever = next(s for s in LIB if s.name == "cuda_graphs_enable")
+    arms, _ = plan_arms(base, [lever], booleans=boolean_flags(LIB))
+    assert arms[0].serve_argv == ("vllm", "serve", "/ckpt/kimi",
+                                  "--served-model-name", "kimi")
+
+
+def test_a_changed_drafting_method_is_not_credited_to_the_token_count_lever(tmp_path):
+    """The speculative lever changes the token count. An arm that moved the
+    baseline from n-gram to eagle at the same count measured a method change,
+    and filing that under the token-count lever is evidence for something
+    nobody ran."""
+    ngram = '{"method":"ngram","num_speculative_tokens":2}'
+    base = read_capture(_arm(tmp_path, "b", argv=[*BASE_ARGV, "--speculative-config", ngram]))
+    eagle = read_capture(_arm(tmp_path, "c", argv=[
+        *BASE_ARGV, "--speculative-config",
+        '{"method":"eagle","model":"d","num_speculative_tokens":5}']))
+    with pytest.raises(CaptureError, match="no catalog entry"):
+        compare(base, eagle, library=LIB)
+
+    # The token count alone, on the baseline's own method, is the lever.
+    count = read_capture(_arm(tmp_path, "d", argv=[
+        *BASE_ARGV, "--speculative-config", '{"method":"ngram","num_speculative_tokens":5}']))
+    assert compare(base, count, library=LIB).intervention_name == "speculative_decode_ngram_5"
+
+
+def test_the_same_speculative_config_written_differently_is_no_intervention(tmp_path):
+    """Spacing or key order is not a change. Read as one, the unchanged token
+    count would be filed as a measured A/B of the token-count lever."""
+    base = read_capture(_arm(tmp_path, "b", argv=[
+        *BASE_ARGV, "--speculative-config", '{"method":"ngram","num_speculative_tokens":5}']))
+    cand = read_capture(_arm(tmp_path, "c", argv=[
+        *BASE_ARGV, "--speculative-config",
+        '{"num_speculative_tokens": 5, "method": "ngram"}']))
+    with pytest.raises(CaptureError, match="same server flags"):
+        compare(base, cand, library=LIB)
+    # And the inverse refuses it on its own, whoever calls it.
+    from gitm.optimizer.vllm_knobs import knob_from_server_arg
+    assert knob_from_server_arg("speculative_config", '{"num_speculative_tokens": 5, '
+                                '"method": "ngram"}',
+                                '{"method":"ngram","num_speculative_tokens":5}')[0] == \
+        "speculative_config"

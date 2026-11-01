@@ -38,10 +38,11 @@ realized deltas and sample the knob space stochastically.
 from __future__ import annotations
 
 import random
+import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
@@ -65,7 +66,7 @@ from gitm.optimizer.degradation import (
 )
 from gitm.optimizer.deviation import observed_op
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
-from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES
+from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES, engine_kwargs
 from gitm.tracer.schema import Trace
 
 if TYPE_CHECKING:
@@ -273,6 +274,13 @@ class AutoresearchRun:
     #: in for the generative proposer, an unscoped search, nothing to propose, or
     #: the pass not running at all. Empty means it searched what it meant to.
     degradations: list[Degradation] = field(default_factory=list)
+    #: Ranked candidates the pass never reached: the engine was lost part-way,
+    #: or the budget ran out. Counted here because only the pass knows what it
+    #: had ranked.
+    n_untried: int = 0
+    #: Why the pass stopped before its ranking ran out: ``"engine lost"``,
+    #: ``"budget"``, or ``None`` when it tried everything it ranked.
+    stopped_by: str | None = None
 
 
 #: The honest, unproven delta band every candidate carries until the measured A/B
@@ -549,10 +557,31 @@ _NON_TUNABLE_HINTS = (
     "kv_sharing",
 )
 
+#: Field-name prefixes for settings that cannot move decode throughput in the
+#: workload this searches. Matched as prefixes, not substrings:
+#: ``cpu_offload_gb`` is a real standalone knob and must survive ``offload_``.
+_NOT_DECODE_PREFIXES = (
+    # Proposed anyway because the knob surface is every EngineArgs field. Each
+    # costs an engine rebuild, and on real runs they made up most of the "wins"
+    # that were noise (P2-2):
+    #   offload_*        only work as a joint configuration; proposed alone they
+    #                    fail to build ("offload_num_in_group (1) must be <=
+    #                    offload_group_size (0)", L-21) or do nothing.
+    #   mm_*             multimodal processor caches; the decode workload is text.
+    #   safetensors_*    how weights load, not how the model runs.
+    #   kv_cache_metrics observability sampling, not performance.
+    "offload_",
+    "mm_",
+    "safetensors_",
+    "kv_cache_metrics",
+)
+
 
 def _is_tunable(field_name: str) -> bool:
     """False for EngineArgs fields that aren't runtime performance knobs."""
     lname = field_name.lower()
+    if lname.startswith(_NOT_DECODE_PREFIXES):
+        return False
     return not any(h in lname for h in _NON_TUNABLE_HINTS)
 
 
@@ -1196,7 +1225,13 @@ class StochasticProposer(_ProposerBase):
         return out
 
 
-def autoresearch_v0(
+def autoresearch_v0(trace: Trace, bottleneck_class: str, **kw: Any) -> list[AutoresearchResult]:
+    """The results of one pass. See :func:`_autoresearch_pass`, which also says
+    how many ranked candidates were left untried."""
+    return _autoresearch_pass(trace, bottleneck_class, **kw)[0]
+
+
+def _autoresearch_pass(
     trace: Trace,
     bottleneck_class: str,
     *,
@@ -1211,7 +1246,9 @@ def autoresearch_v0(
     gpu_sku: str | None = None,
     fingerprint: str | None = None,
     degradations: DegradationLog | None = None,
-) -> list[AutoresearchResult]:
+    deadline_ns: int | None = None,
+    on_result: Callable[[AutoresearchResult], None] | None = None,
+) -> tuple[list[AutoresearchResult], int, str | None]:
     """Propose → gate → (apply + measure + rollback) for one bottleneck class.
 
     Proposals are ranked and pre-filtered by :func:`select_interventions` (the
@@ -1241,7 +1278,7 @@ def autoresearch_v0(
     else:
         proposals = proposer.propose(bottleneck_class, target_op=target_op)
     if not proposals:
-        return []
+        return [], 0, None
 
     # ``history``/``gpu_sku``/``fingerprint`` are what the catalog is ranked
     # with. Autoresearch results are exported to the same verification.json the
@@ -1255,6 +1292,13 @@ def autoresearch_v0(
     aimed_at = target.op if target is not None else None
 
     results: list[AutoresearchResult] = []
+    n_untried = 0
+    # Set once a restore fails. The pass keeps walking the ranking, but only to
+    # record what the gate had already rejected — that verdict needs no engine,
+    # and dropping it would leave those candidates in neither the rejected count
+    # nor the untried one. Every survivor after that point is counted untried.
+    lost = False
+    stopped_by: str | None = None
     for c in ranked:
         # Gate rejection wins; else the caller's veto (e.g. a live structural knob
         # with no restart hook) can reject before we touch the engine. Rejected
@@ -1265,8 +1309,22 @@ def autoresearch_v0(
         # cannot stop a known loser: sorted last, it still ran. A candidate this
         # box already measured at no gain is a result in hand, not an experiment,
         # and re-running it spends an A/B (often a restart) to learn it again.
+        # Checked before the lost-engine exit below: like the gate, it is a
+        # verdict from the record, and needs no engine to reach.
         if reason is None and c.delta_source == "measured" and c.predicted_delta <= 0:
             reason = f"history: measured {c.predicted_delta:+.1%} on this box; not re-run"
+        # The budget is checked before each apply, as Phase 4 checks it between
+        # candidates. The pass used to run every survivor regardless, so a
+        # 15-minute run took 36 (P2-7). Out of budget is handled like a lost
+        # engine: gate verdicts are still recorded, survivors count as untried.
+        if (not lost and reason is None and deadline_ns is not None
+                and time.time_ns() >= deadline_ns):
+            lost, stopped_by = True, "budget"
+        if lost and reason is None:
+            n_untried += 1
+            continue
+        # The caller's veto can read the engine (a prerequisite, a restart hook),
+        # so it is only asked while there is one.
         if reason is None and reject is not None:
             reason = reject(c.spec)
         pre_cfg: dict | None = None
@@ -1284,12 +1342,11 @@ def autoresearch_v0(
                 else None
             )
             if pre_cfg is not None:
-                post_cfg = {**pre_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
+                post_cfg = {**pre_cfg, **engine_kwargs(c.spec.knob_values, pre_cfg)}
         else:
             applied = None
             ab = None
-        results.append(
-            AutoresearchResult(
+        result = AutoresearchResult(
                 spec=c.spec,
                 bottleneck_class=bottleneck_class,
                 predicted_delta=c.predicted_delta,
@@ -1305,9 +1362,17 @@ def autoresearch_v0(
                 candidate_config=post_cfg,
                 degradations=(degradations.measured_under(c.spec.name)
                               if degradations is not None and applied is not None else []),
-            )
         )
-    return results
+        results.append(result)
+        if on_result is not None:
+            # As each result lands, so a run killed mid-pass keeps it.
+            on_result(result)
+        if applied is not None and applied.restore_failed:
+            # The baseline is gone, so every candidate after this one would be
+            # measured against nothing. The caller reads the flag off this
+            # result and records why the pass ended early.
+            lost, stopped_by = True, "engine lost"
+    return results, n_untried, stopped_by
 
 
 def autoresearch(
@@ -1324,6 +1389,8 @@ def autoresearch(
     gpu_sku: str | None = None,
     fingerprint: str | None = None,
     degradations: DegradationLog | None = None,
+    deadline_ns: int | None = None,
+    on_result: Callable[[AutoresearchResult], None] | None = None,
 ) -> AutoresearchRun:
     """Classify the trace's bottleneck, then run the full propose→gate→apply pass.
 
@@ -1346,7 +1413,7 @@ def autoresearch(
     """
     bottleneck_class = classify_bottleneck(trace, residuals)
     target = largest_residual(residuals) if residuals is not None else None
-    results = autoresearch_v0(
+    results, n_untried, stopped_by = _autoresearch_pass(
             trace,
             bottleneck_class,
             applicator=applicator,
@@ -1360,12 +1427,16 @@ def autoresearch(
             gpu_sku=gpu_sku,
             fingerprint=fingerprint,
             degradations=degradations,
+            deadline_ns=deadline_ns,
+            on_result=on_result,
     )
     return AutoresearchRun(
         bottleneck_class=bottleneck_class,
         target=target,
         results=results,
         degradations=_search_degradations(trace, bottleneck_class, target, proposer, results),
+        n_untried=n_untried,
+        stopped_by=stopped_by,
     )
 
 

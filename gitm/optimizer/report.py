@@ -21,12 +21,16 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 class Claim:
     summary: str
     residual_invariant: str  # "kernel_time" | "memory_traffic" | "stream_concurrency"
-    residual_value: float
-    causal_evidence: str  # human-readable from RankedHypotheses
+    residual_value: float | None  # None: not computed; residual_note says why
+    causal_evidence: str  # status text from attribution.granger_evidence, or the live A/B
     intervention_name: str
     predicted_delta: float
     measured_delta: float | None
     rolled_back: bool = False
+    residual_note: str | None = None
+    #: The gate rejected this candidate and the baseline could not be put back.
+    #: Not rolled back, and not kept either, so it is counted as neither.
+    restore_failed: bool = False
     #: Unreliable degradations this claim's own A/B was measured under. Its delta
     #: is still shown, but it is not a verified claim.
     unreliable_ab: list[str] = field(default_factory=list)
@@ -115,15 +119,21 @@ def _default_summary(claims: list[Claim]) -> str:
     # A claim whose own A/B was flagged unreliable keeps its row, but the
     # headline does not add it up as verified. Judged per claim: one bad A/B does
     # not discount the others.
-    measured = [c for c in claims if c.measured_delta is not None and not c.rolled_back]
+    measured = [c for c in claims if c.measured_delta is not None
+                and not c.rolled_back and not c.restore_failed]
     verified = [c for c in measured if not c.unreliable_ab]
     bad, stages = _unreliable(measured)
     note = (f" {len(bad)} more not counted: their A/B is unreliable ({', '.join(stages)})."
             if bad else "")
     if not verified:
         return "No claims verified within budget. See diagnostic below." + note
-    total = sum(c.measured_delta or 0.0 for c in verified)
-    return f"{len(verified)} verified claims, aggregate measured delta {total:+.1%}." + note
+    # Not summed (L-10). Each claim was measured in its own A/B against its own
+    # baseline, and nothing ran with them all applied, so a total is not a
+    # quantity anything measured. Runs reported +324.6% that way.
+    best = max(verified, key=lambda c: c.measured_delta or 0.0)
+    return (f"{len(verified)} claim(s) kept on a measured A/B; the largest is "
+            f"{best.measured_delta:+.1%} ({best.intervention_name}). Each was measured "
+            "in its own A/B, so the deltas do not add up to a run total." + note)
 
 
 def build_provenance(

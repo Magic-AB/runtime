@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from math import isfinite
 from pathlib import Path
@@ -86,9 +87,12 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None):
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
         return _sparse(cfg, name=name)
-    raise NotImplementedError(
-        "no config reader for the dense family yet — build a ModelSpec directly"
-    )
+    # The dense reader refuses (DenseConfigUnsupported, a ValueError and a
+    # NotImplementedError) anything it cannot price exactly: detect_family's
+    # "dense" is a fallback, not a positive identification.
+    from gitm.planner.graph import spec_from_hf_config as _dense
+
+    return _dense(cfg, name=name)
 
 
 def predict_for_config(
@@ -104,7 +108,9 @@ def predict_for_config(
     Raises
     ------
     NotImplementedError
-        For the dense family, which has no config reader. Deliberately an
+        For a config that falls through to the dense family but is not a plain
+        dense transformer (or omits a shape the dense graph needs). The raised
+        ``DenseConfigUnsupported`` is also a ``ValueError``. Deliberately an
         exception rather than a silently generic graph: a dense prediction for a
         checkpoint whose shape was never read would produce residuals against a
         model of something else.
@@ -126,12 +132,10 @@ def predict_for_config(
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
         return predict_moe_graph(_sparse(cfg, name=name), hw, batch, sharding), family
-    raise NotImplementedError(
-        f"{name or 'this checkpoint'} is neither a hybrid linear-attention MoE, a "
-        "GLM-5.2-class glm_moe_dsa, nor a DeepSeek-V4-class sparse-MoE checkpoint. The "
-        "dense graph models it, but has no config reader — construct a ModelSpec and "
-        "call predict_graph directly."
-    )
+    from gitm.planner.graph import predict_dense_graph
+    from gitm.planner.graph import spec_from_hf_config as _dense
+
+    return predict_dense_graph(_dense(cfg, name=name), hw, batch, sharding), family
 
 
 # ── ``gitm plan``: the CLI front for everything above ───────────────────────
@@ -212,25 +216,48 @@ def _hardware(sku: str | None) -> HardwareSpec:
 
 def _load(model: str) -> tuple[Any, str, str]:
     """``(spec, family, provenance_note)`` from a catalogue name or a config path."""
-    from gitm.planner.model_catalogue import available, load_entry, load_spec
+    from gitm.planner.model_catalogue import _resolve, available, load_entry, load_spec
 
     p = Path(model)
-    if p.suffix == ".json" and p.is_file():
-        cfg = json.loads(p.read_text())
-        # Family first: the dense reader raises, and the caller wants to decline
-        # with a message rather than surface a NotImplementedError.
-        family = detect_family(cfg)
-        if family == "dense":
-            return None, family, "config.json (no provenance)"
-        return (spec_from_hf_config(cfg, name=str(p)), family,
-                "config.json (no provenance)")
 
-    if model in available() or Path(model).suffix in (".yaml", ".yml"):
+    # The catalogue first, for every form including a path. An entry carries a
+    # corrected family and fields fitted by hand that a raw config does not, so
+    # where both exist the entry is the better answer — and a `config.json`
+    # inside an HF snapshot is exactly that case: the directory above it still
+    # names the model. `_resolve` takes a stem, a model id, or a cache path.
+    #
+    # Existence is tested separately from loading: `load_entry` also raises
+    # FileNotFoundError when an entry's `extends` base is missing, and catching
+    # that here would report a broken entry as an absent one and quietly fall
+    # back to the raw config.
+    try:
+        _resolve(model)
+    except FileNotFoundError:
+        entry = None
+    else:
         entry = load_entry(model)
+    if entry is not None:
+        if entry.get("execution_status") == "static_only":
+            raise ValueError(f"{model}: checkpoint evidence only; planner integration pending")
         prov = entry.get("provenance", {})
         est = [e.get("field") for e in prov.get("estimated", [])]
         note = f"catalogue; fitted fields: {est or 'none'}"
+        if entry.get("checkpoint"):
+            note += "; STATIC_CHECKPOINT_ONLY; UNVERIFIED: engine, deployment, traffic, trace"
         return load_spec(model), entry["family"], note
+
+    # No entry: read the checkpoint itself, from a config.json path or from the
+    # directory holding one.
+    cfg_path = p / "config.json" if p.is_dir() else p
+    if cfg_path.suffix == ".json" and cfg_path.is_file():
+        cfg = json.loads(cfg_path.read_text())
+        family = detect_family(cfg)
+        # Named by what the caller asked for, not by the file that answered. A
+        # directory is how a local checkpoint is identified; reporting every one
+        # of them as `.../config.json` makes two of them indistinguishable in the
+        # table, the sweep and the JSON output.
+        return (spec_from_hf_config(cfg, name=model), family,
+                "config.json (no provenance)")
 
     raise FileNotFoundError(
         f"no catalogue entry or config.json at {model!r}. "
@@ -247,9 +274,33 @@ def _predict(spec, family: str, hw, batch, sharding):
         from gitm.planner.glm_graph import predict_glm_graph
 
         return predict_glm_graph(spec, hw, batch, sharding)
+    if family == "dense":
+        from gitm.planner.graph import predict_dense_graph
+
+        return predict_dense_graph(spec, hw, batch, sharding)
     from gitm.planner.moe_graph import predict_moe_graph
 
     return predict_moe_graph(spec, hw, batch, sharding)
+
+
+def _prediction_semantics() -> dict[str, Any]:
+    """Interpret the legacy aggregate without asserting an empirical latency.
+
+    A sum of modeled node costs is a whole-step lower bound only after its
+    traffic, rate and schedule assumptions have been established. Keep the
+    numeric legacy result unchanged; expose the interpretation to JSON clients.
+    """
+    return {
+        "kind": "serial_resource_proxy",
+        "aggregation": "sum_of_node_t_pred_s",
+        "latency_estimate_s": None,
+        "whole_step_bound_status": "not_validated",
+        "assumptions": [
+            "configured rates bound the resources used by this backend",
+            "modeled bytes match physical traffic at those resources",
+            "serial node aggregation matches the execution schedule",
+        ],
+    }
 
 
 def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
@@ -321,7 +372,7 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
     n_launch = sum(1 for n in g.nodes if n.prediction.bound == "launch")
     out += [
         "",
-        f"  floor {total * 1e3:.3f} ms/step   " + (
+        f"  serial proxy {total * 1e3:.3f} ms/step   " + (
             f"{g.batch.prefill_tokens / total:,.0f} tok/s "
             f"prefilling {g.batch.prefill_tokens:,} tokens"
             if g.batch.is_prefill
@@ -355,9 +406,10 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
         out.append("  ! priced against fallback peaks — the ceiling is low in a "
                    "known direction")
     out.append("")
-    out.append("  This is a floor at vendor peak, not a target. A measured kernel is")
-    out.append("  slower by whatever the implementation leaves on the table; a residual")
-    out.append("  here is a lead, not a defect.")
+    out.append("  This is a serial sum of modeled node costs at configured rates.")
+    out.append("  It is not an empirical latency target. A whole-step lower bound")
+    out.append("  needs validated traffic, rate and serial-schedule assumptions.")
+    out.append("  A residual is a lead, not by itself a defect.")
     return "\n".join(out)
 
 
@@ -395,11 +447,6 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"cannot plan: {e}")
         return 2
-    if family == "dense":
-        print(f"cannot plan: {args.model} resolves to the dense family, which has no "
-              "config reader. Build a ModelSpec and call predict_graph directly.")
-        return 2
-
     if args.kv_cache_dtype != "auto":
         from dataclasses import fields as _fields
         from dataclasses import replace as _replace_spec
@@ -415,14 +462,17 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         spec = _replace_spec(spec, **kv)
 
+    from gitm.planner.context import peak_for_sku
+
     hw = _hardware(args.gpu)
     if args.launch_overhead is not None:
         from dataclasses import replace as _replace
 
         hw = _replace(hw, kernel_launch_overhead_s=args.launch_overhead)
-    if args.gpu and args.gpu.lower() not in hw.name.lower():
+    # Not a name check: "A10" is inside the fallback's "A100-SXM4-80GB".
+    if args.gpu and peak_for_sku(args.gpu) is None:
         print(f"warning: --gpu {args.gpu!r} is not in the catalogue; priced against "
-              f"{hw.name}, whose bandwidth may differ by more than 2x.")
+              f"{hw.name}, whose bandwidth may differ by more than 2x.", file=sys.stderr)
 
     sharding = ShardingConfig(tp=args.tp, ep=args.ep, dp=args.dp)
 
@@ -436,11 +486,15 @@ def main(argv: list[str] | None = None) -> int:
               f"kv_len={args.kv_len}, TP={args.tp} EP={args.ep}")
         print(f"  {'batch':>7s} {'ms/step':>10s} {'tok/s':>12s} {'compute-bound':>14s}")
         for b in sizes:
-            g = _predict(spec, family, hw,
-                         BatchConfig(batch=b, kv_cache_len=args.kv_len,
-                                     speculative_tokens=args.spec_tokens,
-                                     acceptance_rate=args.acceptance_rate),
-                         sharding)
+            try:
+                g = _predict(spec, family, hw,
+                             BatchConfig(batch=b, kv_cache_len=args.kv_len,
+                                         speculative_tokens=args.spec_tokens,
+                                         acceptance_rate=args.acceptance_rate),
+                             sharding)
+            except ValueError as e:
+                print(f"cannot plan: {e}")
+                return 2
             cb = sum(1 for n in g.nodes if n.prediction.bound == "compute")
             print(f"  {b:7d} {g.total_pred_s * 1e3:9.3f} "
                   f"{b / g.total_pred_s:12,.0f} {cb:9d}/{len(g.nodes)}")
@@ -469,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "model": getattr(spec, "name", None),
             "family": family,
+            "provenance": note,
             "hardware": hw.name,
             "sharding": {"tp": args.tp, "ep": args.ep, "dp": args.dp},
             "batch": {"batch": args.batch, "kv_cache_len": args.kv_len,
@@ -484,6 +539,7 @@ def main(argv: list[str] | None = None) -> int:
             "memory_fit": fit_data,
             "memory_fit_unavailable_reason": None if fit_data is not None else fit_why,
             "total_pred_s": g.total_pred_s,
+            "prediction_semantics": _prediction_semantics(),
             "has_unpriced_collectives": g.has_unpriced_collectives,
             "has_fallback_peaks": g.has_fallback_peaks,
             "nodes": [
