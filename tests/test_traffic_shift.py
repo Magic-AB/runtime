@@ -270,3 +270,25 @@ def test_pair_distance_refuses_empty_windows_and_a_bad_cutoff():
         pair_distance(base, empty)
     with pytest.raises(ValueError):
         pair_distance(base, base, cutoff=0.0)
+
+
+def test_pair_distance_gives_the_three_way_call_a_window_runner_needs():
+    from gitm.traffic.shift import NOT_ENOUGH, NOT_SIMILAR, SIMILAR, pair_distance
+
+    base = _poisson_profile(400, 100.0)
+    assert pair_distance(base, _poisson_profile(400, 100.0)).verdict == SIMILAR
+    assert pair_distance(base, _poisson_profile(400, 100.0, in_mult=2.0)).verdict == NOT_SIMILAR
+    short = pair_distance(base, _poisson_profile(60, 100.0))
+    assert short.verdict == NOT_ENOUGH and short.shortfall == 140  # 200 - 60
+    assert pair_distance(base, _poisson_profile(400, 100.0)).shortfall == 0
+
+
+def test_the_ledger_fields_carry_the_raw_distance_and_what_it_was_judged_against():
+    from gitm.traffic.shift import pair_distance
+
+    pd = pair_distance(_poisson_profile(400, 100.0), _poisson_profile(400, 100.0, in_mult=2.0),
+                       cutoff=0.3)
+    f = pd.ledger_fields()
+    assert f["traffic_distance"] == pd.distance and f["traffic_cutoff"] == 0.3
+    assert f["traffic_verdict"] == pd.verdict and f["traffic_noise_floor"] == pd.noise_floor
+    assert f["traffic_requests_window"] == 400

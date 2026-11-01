@@ -48,9 +48,12 @@ import numpy as np
 from gitm.traffic.regime import index_of_dispersion
 from gitm.traffic.schema import Trace
 
+SIMILAR, NOT_SIMILAR, NOT_ENOUGH = "similar", "not_similar", "not_enough_requests"
+
 __all__ = [
     "N_BINS", "PairDistance", "ShiftConfig", "ShiftResult", "TrafficProfile",
     "detect_shift", "distance_components", "pair_distance", "SHIFTED", "STABLE", "INCONCLUSIVE",
+    "SIMILAR", "NOT_SIMILAR", "NOT_ENOUGH",
 ]
 
 SHIFTED = "shifted"
@@ -308,7 +311,11 @@ class PairDistance:
     ``noise_floor`` is the ``null_quantile`` of the distance two same-shape samples of these
     sizes show by chance. ``similar`` applies the same rule :func:`detect_shift` uses,
     ``distance <= max(cutoff, noise_floor)``; ``enough_data`` says whether both windows reached
-    ``config.min_requests`` (below that, treat ``similar`` as unreliable).
+    ``config.min_requests`` (below that, ``similar`` is unreliable).
+
+    ``verdict`` is the three-way call a window runner wants: ``similar``, ``not_similar``, or
+    ``not_enough_requests``, in which case the runner should extend the window and ask again, not
+    compare. ``shortfall`` is how many more requests the smaller window needs to get there.
     """
 
     distance: float
@@ -320,6 +327,22 @@ class PairDistance:
     cutoff: float
     similar: bool
     enough_data: bool
+    shortfall: int = 0
+
+    @property
+    def verdict(self) -> str:
+        if not self.enough_data:
+            return NOT_ENOUGH
+        return SIMILAR if self.similar else NOT_SIMILAR
+
+    def ledger_fields(self) -> dict[str, object]:
+        """What to record on a ledger row, so the cutoff can be re-tuned on real traffic later."""
+        return {
+            "traffic_distance": self.distance, "traffic_distance_axis": self.limiting_axis,
+            "traffic_noise_floor": self.noise_floor, "traffic_cutoff": self.cutoff,
+            "traffic_verdict": self.verdict, "traffic_requests_baseline": self.n_baseline,
+            "traffic_requests_window": self.n_window,
+        }
 
 
 def pair_distance(
@@ -348,7 +371,8 @@ def pair_distance(
         distance=d, components=comps, limiting_axis=axis, n_baseline=baseline.requests,
         n_window=window.requests, noise_floor=floor, cutoff=cutoff,
         similar=d <= max(cutoff, floor),
-        enough_data=min(baseline.requests, window.requests) >= config.min_requests)
+        enough_data=min(baseline.requests, window.requests) >= config.min_requests,
+        shortfall=max(0, config.min_requests - min(baseline.requests, window.requests)))
 
 
 def detect_shift(
