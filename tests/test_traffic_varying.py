@@ -148,3 +148,17 @@ def test_the_default_trace_survives_the_timed_trace_round_trip(tmp_path, seed):
     write_timed_trace(t, out)
     report = compare(t, read_timed_trace(out), thresholds=REPLAY_THRESHOLDS)
     assert report.passed, report.render()
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_every_phase_reaches_the_detectors_request_floor_in_reasonable_time(seed):
+    """ENG-183 sizes windows by request count (about 200). The quiet stretches are the slowest
+    to fill, so each phase must reach 200 requests quickly (measured worst case over 200
+    seeds is about 63 s against a 120 s phase) or the runner would wait too long to compare."""
+    t = varying_trace(seed=seed)
+    start = 0.0
+    for p in DEFAULT_PHASES:
+        in_phase = [a - start for a in t.arrivals if start <= a < start + p.duration_s]
+        assert len(in_phase) >= 200, (p.name, len(in_phase))
+        assert in_phase[199] <= 80.0, (p.name, in_phase[199])
+        start += p.duration_s
